@@ -1,0 +1,24 @@
+{
+  "project": "isla",
+  "mainBranch": "main",
+  "worktrees": {
+    "dir": ".worktrees",
+    "branchPrefixes": ["feat/", "fix/", "chore/", "docs/"]
+  },
+  "checks": {
+    "format": "cargo fmt --check",
+    "lint": "cargo clippy --release -- -D warnings",
+    "build": "cargo build --release"
+  },
+  "worker": {
+    "enabled": false,
+    "tool": "opencode",
+    "reason": "La plantilla del workflow (scripts/agents/worker.mjs y harness) no está instalada. Sin sus frenos técnicos el worker no se usa."
+  },
+  "redWorker": false,
+  "criticalZones": [
+    { "path": "src/sys.rs", "reason": "Escribe en el registro del usuario (inicio con Windows)" },
+    { "path": ".github/workflows/", "reason": "Publica releases que otros descargan" }
+  ],
+  "sensitive": []
+}
