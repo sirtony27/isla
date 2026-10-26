@@ -8,24 +8,27 @@ Actualizado: 2026-10-26
   0003 (v0.2: avisos del sistema y opciones), 0004 (letras sincronizadas con LRCLIB: única excepción a "sin red", apagadas por defecto).
 - Presupuesto de rendimiento en `AGENTS.md`: 0 % de CPU en reposo y ≤ 20 MB privados con todo activado.
 - Repo público: https://github.com/sirtony27/isla.
-- **v0.3.1** en `main` (`57e862a`, PR #7, merge aprobado por el dueño) y publicado como release por
-  la CI: https://github.com/sirtony27/isla/releases/tag/v0.3.1 — `isla.exe` (490 KB, MSVC) +
+- **v0.3.2** en `main` (`5c1e68d`, PR #10, merge aprobado por el dueño) y publicado como release por
+  la CI: https://github.com/sirtony27/isla/releases/tag/v0.3.2 — `isla.exe` (490 KB, MSVC) +
   `isla.exe.sha256` con LF. Verificado: `sha256sum -c` OK, solo DLLs de Windows, sin
-  `VCRUNTIME140.dll` ni `winhttp.dll` en las importaciones. Novedad: cumple la regla "apagada, no
-  registra eventos ni carga DLLs" (PR #6): Core Audio bajo demanda, brillo solo con su aviso y el hilo
-  de mic/cámara se detiene al apagarlo. Auditoría: `docs/audits/2026-10-26-budget-toggles.md`
-  (con esos avisos apagados: sin DLLs de Core Audio, 8,0–8,4 MB privados, 0 ms de CPU).
+  `VCRUNTIME140.dll` ni `winhttp.dll` en las importaciones, y se identifica como `Isla/0.3.2`.
+  Novedad: si LRCLIB está saturado o no hay red, la letra se reintenta a los 2, 5, 10 y 20 s
+  mientras suene la misma canción (PR #9). Auditoría, con la comparación de fuentes gratis (solo
+  LRCLIB sirve): `docs/audits/2026-10-26-lyrics-retry.md` (en reposo, igual que v0.3.1: 11,2 MB
+  privados y 0 ms de CPU).
+- v0.3.1 (`57e862a`, PR #7): cumple la regla "apagada, no registra eventos ni carga DLLs" (PR #6).
+  Auditoría: `docs/audits/2026-10-26-budget-toggles.md`.
 - v0.3.0 (`9465bea`, PR #4): letras sincronizadas de LRCLIB, apagadas por defecto. Auditoría:
   `docs/audits/2026-10-26-lyrics.md` (10,2 MB privados con letras apagadas; 13,4–14,3 MB con letras).
-- v0.3.0, v0.2.0 y v0.1.0 siguen publicados; el `.sha256` de v0.1.0 tiene CRLF (desde v0.2.0, LF).
+- v0.3.1, v0.3.0, v0.2.0 y v0.1.0 siguen publicados; el `.sha256` de v0.1.0 tiene CRLF
+  (desde v0.2.0, LF).
 - Toolchain en la PC del dueño: rustup `stable-x86_64-pc-windows-gnu` con el target
   `x86_64-pc-windows-msvc` (solo para `cargo check`/`clippy`), componentes clippy, rustfmt y
   llvm-tools. PATH del sistema no modificado: para compilar, anteponer `%USERPROFILE%\.cargo\bin`
   y `%USERPROFILE%\.cargo\llvm-dlltool` (ver CONTRIBUTING.md).
-- Isla corre en la PC del dueño compilada desde `main` (`ab98fc8`: v0.3.1 más los reintentos de
-  letras), desde `target\release\isla.exe` de la carpeta principal, con inicio automático. Cada
-  arranque reescribe la ruta de inicio automático con la del exe que arrancó: tras probar desde un
-  worktree, relanzar desde la carpeta principal.
+- Isla v0.3.2 corre en la PC del dueño desde `target\release\isla.exe` de la carpeta principal, con
+  inicio automático. Cada arranque reescribe la ruta de inicio automático con la del exe que
+  arrancó: tras probar desde un worktree, relanzar desde la carpeta principal.
 
 ## Pendientes
 
@@ -35,9 +38,6 @@ Actualizado: 2026-10-26
   brillo, cambio de salida de audio, batería baja, monitor activo (si hay dos monitores).
 - QA del dueño de v0.3.1: apagar y volver a encender el aviso de brillo, y apagar el de mic/cámara
   desde el menú (no se probó con un script para no cambiar el brillo ni operar el menú de su PC).
-- Reintentos de letras ante LRCLIB saturado: en `main` (`ab98fc8`, PR #9; sale en v0.3.2). Si
-  falla, reintenta a los 2, 5, 10 y 20 s mientras suene la misma canción. Ver
-  `docs/audits/2026-10-26-lyrics-retry.md`, que también compara fuentes gratis (solo LRCLIB sirve).
 - Letras: si la versión de Spotify dura más de 3 s distinto que las de LRCLIB, no hay letra (p. ej.
   "Soulmate" de Mac Miller: 267 s en Spotify, 273–278 s en LRCLIB). Ampliar la tolerancia puede
   desfasar la letra: lo decide el dueño.
