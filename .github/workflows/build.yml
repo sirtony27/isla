@@ -36,7 +36,8 @@ jobs:
         shell: pwsh
         run: |
           $hash = (Get-FileHash target/release/isla.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  isla.exe" | Out-File -Encoding ascii target/release/isla.exe.sha256
+          # LF line ending so `sha256sum -c` also works on Linux and Git Bash.
+          Set-Content -Path target/release/isla.exe.sha256 -Value "$hash  isla.exe`n" -NoNewline -Encoding ascii
           Get-Content target/release/isla.exe.sha256
 
       - uses: actions/upload-artifact@v4
