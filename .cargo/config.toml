@@ -1,0 +1,11 @@
+# MSVC (CI and most contributors): link the C runtime statically so the exe
+# runs on any Windows 10/11 without the Visual C++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# GNU toolchain (no Visual Studio): link with the bundled rust-lld instead of
+# MinGW's ld, which fails on user folders with non-ASCII names.
+# Also needs a `dlltool` on PATH; see CONTRIBUTING.md.
+[target.x86_64-pc-windows-gnu]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld.lld"]

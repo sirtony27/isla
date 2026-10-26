@@ -14,7 +14,7 @@
 | Lint | `cargo clippy --release -- -D warnings` |
 | Tests | no aplica en v1 (UI y APIs del sistema; se valida con QA) |
 
-Toolchain local: `stable-x86_64-pc-windows-gnu` (sin Visual Studio). CI: `windows-latest` con MSVC.
+Toolchain local: `stable-x86_64-pc-windows-gnu` (sin Visual Studio) + `llvm-ar` como `dlltool` y `rust-lld` (ver CONTRIBUTING.md y decisión 0002). CI: `windows-latest` con MSVC.
 
 ## Entornos
 
