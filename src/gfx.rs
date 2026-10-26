@@ -30,8 +30,8 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat,
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -45,11 +45,14 @@ use windows_numerics::Matrix3x2;
 
 /// Text formats. Device-independent, so they survive a GPU reset.
 pub struct Fonts {
+    dw: IDWriteFactory,
     pub clock: IDWriteTextFormat,
     pub title: IDWriteTextFormat,
     pub body: IDWriteTextFormat,
     pub small: IDWriteTextFormat,
     pub label: IDWriteTextFormat,
+    /// For lyric lines too long for `label`.
+    pub label_small: IDWriteTextFormat,
 }
 
 impl Fonts {
@@ -90,7 +93,26 @@ impl Fonts {
                 body: make(13.0, DWRITE_FONT_WEIGHT_NORMAL)?,
                 small: make(11.0, DWRITE_FONT_WEIGHT_NORMAL)?,
                 label: make(13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+                label_small: make(11.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+                dw,
             })
+        }
+    }
+}
+
+impl Fonts {
+    /// Width in DIPs of `s` on a single line in `format`.
+    pub fn width(&self, s: &str, format: &IDWriteTextFormat) -> f32 {
+        let wide: Vec<u16> = s.encode_utf16().collect();
+        unsafe {
+            let Ok(layout) = self.dw.CreateTextLayout(&wide, format, 4096.0, 64.0) else {
+                return 0.0;
+            };
+            let mut m = DWRITE_TEXT_METRICS::default();
+            match layout.GetMetrics(&mut m) {
+                Ok(()) => m.width,
+                Err(_) => 0.0,
+            }
         }
     }
 }

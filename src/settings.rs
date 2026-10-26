@@ -26,6 +26,12 @@ pub struct Settings {
     pub notify_privacy: bool,
     pub focus_min: u32,
     pub break_min: u32,
+    /// Synced lyrics from LRCLIB. Off by default: it is the only feature that uses the network.
+    pub lyrics: bool,
+    /// Milliseconds the lyrics are shown ahead of the player's position (negative: later).
+    pub lyrics_offset: i32,
+    /// The open panel shows the lyrics instead of the volume row and the cards.
+    pub lyrics_view: bool,
 }
 
 impl Default for Settings {
@@ -50,6 +56,9 @@ impl Default for Settings {
             notify_privacy: true,
             focus_min: 25,
             break_min: 5,
+            lyrics: false,
+            lyrics_offset: 0,
+            lyrics_view: false,
         }
     }
 }
@@ -97,6 +106,15 @@ impl Settings {
                 "notify_privacy" => s.notify_privacy = on,
                 "focus_min" => s.focus_min = num(1, 120, s.focus_min),
                 "break_min" => s.break_min = num(1, 60, s.break_min),
+                "lyrics" => s.lyrics = on,
+                "lyrics_offset" => {
+                    s.lyrics_offset = value
+                        .parse::<i32>()
+                        .ok()
+                        .filter(|v| (-5000..=5000).contains(v))
+                        .unwrap_or(0)
+                }
+                "lyrics_view" => s.lyrics_view = on,
                 _ => {}
             }
         }
@@ -136,6 +154,9 @@ impl Settings {
             format!("notify_privacy={}", b(self.notify_privacy)),
             format!("focus_min={}", self.focus_min),
             format!("break_min={}", self.break_min),
+            format!("lyrics={}", b(self.lyrics)),
+            format!("lyrics_offset={}", self.lyrics_offset),
+            format!("lyrics_view={}", b(self.lyrics_view)),
             String::new(),
         ]
         .join("\n");
