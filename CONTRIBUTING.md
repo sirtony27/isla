@@ -55,7 +55,10 @@ memory and CPU over 10 s idle (Task Manager or `Get-Process isla`).
 | `src/gfx.rs` | Direct2D on a DirectComposition swap chain; fonts |
 | `src/anim.rs` | Spring animation |
 | `src/media.rs` | Now playing via SMTC, on its own thread |
-| `src/sys.rs` | Power status, autostart, time formatting, single instance |
+| `src/audio.rs` | Volume and audio output via Core Audio callbacks |
+| `src/privacy.rs` | Microphone / camera in use, from registry change notifications |
+| `src/focus.rs` | Pomodoro timer state |
+| `src/sys.rs` | Power status, autostart, hotkey, monitors, time formatting, single instance |
 | `src/tray.rs` | Tray icon and menu |
 | `src/settings.rs` | `settings.ini` load and save |
 | `src/i18n.rs` | Translations |

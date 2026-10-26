@@ -2,52 +2,70 @@
 //! Everything here runs on the UI thread, driven by window messages.
 
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use windows::core::{w, Result, GUID};
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::ID2D1BitmapBrush1;
 use windows::Win32::Graphics::Gdi::{
-    CreateRectRgn, GetMonitorInfoW, MonitorFromPoint, SetWindowRgn, MONITORINFO,
-    MONITOR_DEFAULTTOPRIMARY,
+    CreateRectRgn, GetMonitorInfoW, SetWindowRgn, HMONITOR, MONITORINFO,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Power::RegisterPowerSettingNotification;
+use windows::Win32::System::Power::{RegisterPowerSettingNotification, POWERBROADCAST_SETTING};
+use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, ABM_NEW, ABM_REMOVE, ABN_FULLSCREENAPP, APPBARDATA,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{self, Spring};
+use crate::audio::{self, Audio};
+use crate::focus::{Focus, Phase};
 use crate::gfx::{Fonts, Gfx};
 use crate::i18n::{self, Text};
 use crate::media::{self, Info, Media, ART_SIZE};
+use crate::privacy::{self, InUse};
 use crate::settings::Settings;
 use crate::sys::{self, Power};
-use crate::tray::{MenuCmd, MenuState, Tray};
-use crate::ui::{self, Act, Hit, Layers, Mode, View, CX, FLARE, WIN_H, WIN_W};
+use crate::tray::{Alert, MenuCmd, MenuState, Tray};
+use crate::ui::{
+    self, Act, Hit, Layers, Look, Mode, PowerEvent, View, CAM_COLOR, CX, FLARE, HOT_STRIP,
+    MIC_COLOR, WIN_H, WIN_W,
+};
 
 pub const WM_APP_TRAY: u32 = WM_APP + 1;
 pub const WM_APP_MEDIA: u32 = WM_APP + 2;
 pub const WM_APP_APPBAR: u32 = WM_APP + 3;
+pub const WM_APP_AUDIO: u32 = WM_APP + 4;
+pub const WM_APP_PRIVACY: u32 = WM_APP + 5;
+pub const WM_APP_FOREGROUND: u32 = WM_APP + 6;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const NIN_SELECT: u32 = WM_USER;
 const NIN_KEYSELECT: u32 = WM_USER + 1;
 const GUID_ACDC_POWER_SOURCE: GUID = GUID::from_u128(0x5d3e9a59_e9d5_4b00_a6bd_ff34ff516548);
+const GUID_BATTERY_PERCENTAGE_REMAINING: GUID =
+    GUID::from_u128(0xa7ad8041_b45a_4cae_87a3_eecbb468a9e1);
+const GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS: GUID =
+    GUID::from_u128(0x8ffee2c6_2d01_46be_adb9_398addc5b4ff);
 
 // The only timers in the app. None of them polls state.
 const TIMER_HOVER: usize = 1; // one-shot: open after the cursor rests on the notch
 const TIMER_COLLAPSE: usize = 2; // one-shot: close after the cursor leaves
 const TIMER_ACTIVITY: usize = 3; // one-shot: end of a live activity
 const TIMER_CLOCK: usize = 4; // once a minute, on the minute
-const TIMER_PROGRESS: usize = 5; // 1 Hz, only while open and playing
+const TIMER_LIVE: usize = 5; // 1 Hz, only while open and something is counting
 const TIMER_WATER: usize = 6; // every N minutes, only if the reminder is on
+const TIMER_FOCUS: usize = 7; // when the pomodoro's shown minute changes or it ends
 
 const HOVER_DELAY: u32 = 110;
 const LEAVE_DELAY: u32 = 280;
+const LEVEL_DURATION: u32 = 1500;
+const VOLUME_STEP: f32 = 0.02;
 
 pub fn create_window(proc: WNDPROC) -> Result<HWND> {
     unsafe {
@@ -86,6 +104,8 @@ pub struct App {
     gfx: Option<Gfx>,
     settings: Settings,
     dpi: u32,
+    monitor: HMONITOR,
+    foreground_hook: Option<HWINEVENTHOOK>,
 
     mode: Mode,
     last_act: Act,
@@ -105,6 +125,7 @@ pub struct App {
     inside: bool,
     hot: Hit,
     pressed: Hit,
+    dragging_volume: bool,
 
     media: Media,
     info: Info,
@@ -112,31 +133,50 @@ pub struct App {
     art: Option<ID2D1BitmapBrush1>,
     art_pixels: Option<Arc<Vec<u8>>>,
     layers: Layers,
-    progress_timer: bool,
+    live_timer: bool,
+
+    audio: Option<Audio>,
+    brightness: Option<u8>,
+    privacy: Option<Arc<Mutex<InUse>>>,
+    in_use: InUse,
+    privacy_shown: (bool, String),
+    focus: Focus,
+    focus_note: String,
 
     clock: String,
     date: String,
     power: Power,
+    power_event: PowerEvent,
+    /// Lowest battery warning already shown on this discharge (100 = none).
+    low_warned: u8,
+    full_notified: bool,
     tray: Tray,
     taskbar_created: u32,
 }
 
 impl App {
     pub fn new(hwnd: HWND) -> Result<Self> {
-        let (w, h, r) = ui::size_for(Mode::Closed, false);
+        let settings = Settings::load();
+        let power = sys::power();
+        let look = Look {
+            hidden: settings.hidden,
+            ..Look::default()
+        };
+        let (w, h, r) = ui::size_for(Mode::Closed, look);
         let mut app = Self {
             hwnd,
             text: i18n::load(),
             fonts: Fonts::new()?,
             gfx: None,
-            settings: Settings::load(),
             dpi: unsafe { GetDpiForWindow(hwnd) }.max(96),
+            monitor: sys::primary_monitor(),
+            foreground_hook: None,
             mode: Mode::Closed,
             last_act: Act::Track,
             w: anim::size(w),
             h: anim::size(h),
             r: anim::size(r),
-            a_closed: anim::fade(1.0),
+            a_closed: anim::fade(if h > 0.0 { 1.0 } else { 0.0 }),
             a_open: anim::fade(0.0),
             a_act: anim::fade(0.0),
             animating: false,
@@ -148,31 +188,55 @@ impl App {
             inside: false,
             hot: Hit::None,
             pressed: Hit::None,
+            dragging_volume: false,
             media: Media::start(hwnd, WM_APP_MEDIA),
             info: Info::default(),
             media_ready: false,
             art: None,
             art_pixels: None,
             layers: Layers::default(),
-            progress_timer: false,
+            live_timer: false,
+            audio: Audio::new(hwnd, WM_APP_AUDIO).ok(),
+            brightness: None,
+            privacy: settings
+                .notify_privacy
+                .then(|| privacy::start(hwnd, WM_APP_PRIVACY)),
+            in_use: InUse::default(),
+            privacy_shown: (false, String::new()),
+            focus: Focus::default(),
+            focus_note: String::new(),
             clock: sys::clock_text(),
             date: sys::date_text(),
-            power: sys::power(),
+            power,
+            power_event: PowerEvent::Plugged,
+            low_warned: 100,
+            full_notified: power.on_ac && power.percent >= 100,
             tray: Tray::new(hwnd, WM_APP_TRAY),
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+            settings,
         };
         app.roll_water_day();
+        if app.settings.monitor_active {
+            app.foreground_hook = Some(sys::watch_foreground(hwnd, WM_APP_FOREGROUND));
+        }
         app.place();
         unsafe {
             let mut abd = app.appbar_data();
             SHAppBarMessage(ABM_NEW, &mut abd);
-            let _ = RegisterPowerSettingNotification(
-                HANDLE(hwnd.0),
-                &GUID_ACDC_POWER_SOURCE,
-                DEVICE_NOTIFY_WINDOW_HANDLE,
-            );
+            for guid in [
+                GUID_ACDC_POWER_SOURCE,
+                GUID_BATTERY_PERCENTAGE_REMAINING,
+                GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS,
+            ] {
+                let _ = RegisterPowerSettingNotification(
+                    HANDLE(hwnd.0),
+                    &guid,
+                    DEVICE_NOTIFY_WINDOW_HANDLE,
+                );
+            }
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
+        sys::set_hotkey(hwnd, app.settings.hotkey);
         app.set_timer(TIMER_CLOCK, sys::ms_to_next_minute());
         app.schedule_water();
         // Keep the autostart entry pointing at this exe if the user moved it.
@@ -183,6 +247,11 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
+        sys::set_hotkey(self.hwnd, false);
+        if let Some(hook) = self.foreground_hook.take() {
+            sys::unwatch_foreground(hook);
+        }
+        self.audio = None;
         self.tray.remove();
         unsafe {
             let mut abd = self.appbar_data();
@@ -212,18 +281,24 @@ impl App {
         let _ = unsafe { KillTimer(Some(self.hwnd), id) };
     }
 
-    /// Centers the window at the top of the primary monitor and sizes the swap chain.
+    /// Centers the window at the top of the chosen monitor and sizes the swap chain.
     fn place(&mut self) {
+        if !self.settings.monitor_active {
+            self.monitor = sys::primary_monitor();
+        }
         for _ in 0..2 {
             let s = self.scale();
             let (pw, ph) = ((WIN_W * s).ceil() as i32, (WIN_H * s).ceil() as i32);
             unsafe {
-                let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
                 let mut mi = MONITORINFO {
                     cbSize: size_of::<MONITORINFO>() as u32,
                     ..Default::default()
                 };
-                let _ = GetMonitorInfoW(monitor, &mut mi);
+                if !GetMonitorInfoW(self.monitor, &mut mi).as_bool() {
+                    // The monitor went away: fall back to the primary one.
+                    self.monitor = sys::primary_monitor();
+                    let _ = GetMonitorInfoW(self.monitor, &mut mi);
+                }
                 let m = mi.rcMonitor;
                 let x = m.left + (m.right - m.left - pw) / 2;
                 let _ = SetWindowPos(
@@ -260,7 +335,7 @@ impl App {
         self.changed();
     }
 
-    /// Something on screen changed: redraw, re-rendering the cached layers.
+    /// Something static on screen changed: redraw, re-rendering the cached layers.
     fn changed(&mut self) {
         self.dirty = true;
         self.layers.invalidate();
@@ -281,7 +356,7 @@ impl App {
             left: ((CX - w / 2.0 - FLARE) * s).floor() as i32,
             top: 0,
             right: ((CX + w / 2.0 + FLARE) * s).ceil() as i32,
-            bottom: (h * s).ceil() as i32,
+            bottom: (h.max(HOT_STRIP) * s).ceil() as i32,
         }
     }
 
@@ -321,13 +396,29 @@ impl App {
         self.info.active && self.info.playing
     }
 
+    fn look(&self) -> Look {
+        let dot = match (&self.in_use, self.settings.notify_privacy) {
+            (InUse { cam: Some(_), .. }, true) => Some(CAM_COLOR),
+            (InUse { mic: Some(_), .. }, true) => Some(MIC_COLOR),
+            _ => None,
+        };
+        Look {
+            playing: self.playing(),
+            hidden: self.settings.hidden,
+            dot,
+        }
+    }
+
     fn retarget(&mut self) {
-        let (w, h, r) = ui::size_for(self.mode, self.playing());
+        let look = self.look();
+        let (w, h, r) = ui::size_for(self.mode, look);
         self.w.set(w);
         self.h.set(h);
         self.r.set(r);
         let on = |b: bool| if b { 1.0 } else { 0.0 };
-        self.a_closed.set(on(self.mode == Mode::Closed));
+        let closed_visible = ui::size_for(Mode::Closed, look).1 > 0.0;
+        self.a_closed
+            .set(on(self.mode == Mode::Closed && closed_visible));
         self.a_open.set(on(self.mode == Mode::Open));
         self.a_act.set(on(matches!(self.mode, Mode::Activity(_))));
         self.grow_region();
@@ -356,29 +447,40 @@ impl App {
         }
         self.mode = mode;
         self.retarget();
-        self.update_progress_timer();
+        self.update_live_timer();
     }
 
     fn show_activity(&mut self, act: Act, ms: u32) {
-        // While the panel is open its cards already show the same information.
+        // While the panel is open its rows and cards already show the same information.
         if !self.visible || self.mode == Mode::Open {
-            self.changed();
+            self.dirty = true;
             return;
         }
         self.set_mode(Mode::Activity(act));
         self.set_timer(TIMER_ACTIVITY, ms);
+        self.changed();
     }
 
-    fn update_progress_timer(&mut self) {
-        let want =
-            self.visible && self.mode == Mode::Open && self.playing() && self.info.duration > 0.0;
-        if want != self.progress_timer {
+    /// Volume and brightness: repeated changes keep the same activity on screen.
+    fn show_level(&mut self, act: Act) {
+        if self.mode == Mode::Activity(act) {
+            self.set_timer(TIMER_ACTIVITY, LEVEL_DURATION);
+            self.dirty = true;
+        } else {
+            self.show_activity(act, LEVEL_DURATION);
+        }
+    }
+
+    fn update_live_timer(&mut self) {
+        let counting = (self.playing() && self.info.duration > 0.0) || self.focus.phase().is_some();
+        let want = self.visible && self.mode == Mode::Open && counting;
+        if want != self.live_timer {
             if want {
-                self.set_timer(TIMER_PROGRESS, 1000);
+                self.set_timer(TIMER_LIVE, 1000);
             } else {
-                self.kill_timer(TIMER_PROGRESS);
+                self.kill_timer(TIMER_LIVE);
             }
-            self.progress_timer = want;
+            self.live_timer = want;
         }
     }
 
@@ -400,7 +502,7 @@ impl App {
             let _ = ShowWindow(self.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
         }
         self.changed();
-        self.update_progress_timer();
+        self.update_live_timer();
     }
 
     fn springs(&mut self) -> [&mut Spring; 6] {
@@ -459,15 +561,27 @@ impl App {
             a_open: self.a_open.value,
             a_act: self.a_act.value,
             act: self.last_act,
-            playing: self.playing(),
+            look: self.look(),
             info: &self.info,
             art: self.art.as_ref(),
             clock: &self.clock,
             date: &self.date,
             power: self.power,
+            power_event: self.power_event,
             water_ml: self.settings.water_ml,
             water_goal: self.settings.water_goal,
             glass: self.settings.water_glass,
+            volume: self
+                .audio
+                .as_ref()
+                .filter(|a| a.available())
+                .map(|a| (a.level, a.muted)),
+            brightness: self.brightness.unwrap_or(0),
+            device: self.audio.as_ref().map_or("", |a| a.device.as_str()),
+            privacy: (self.privacy_shown.0, &self.privacy_shown.1),
+            focus: self.focus,
+            focus_min: self.settings.focus_min,
+            focus_note: &self.focus_note,
             hot: self.hot,
             text: &self.text,
             fonts: &self.fonts,
@@ -485,11 +599,15 @@ impl App {
     // ---- input ----
 
     fn in_shape(&self, x: f32, y: f32) -> bool {
-        (x - CX).abs() <= self.w.value / 2.0 && y <= self.h.value
+        (x - CX).abs() <= self.w.value / 2.0 && y <= self.h.value.max(HOT_STRIP)
+    }
+
+    fn has_volume(&self) -> bool {
+        self.audio.as_ref().is_some_and(|a| a.available())
     }
 
     fn hit_at(&self, x: f32, y: f32) -> Hit {
-        ui::hit(self.mode, x, y, &self.info)
+        ui::hit(self.mode, x, y, &self.info, self.has_volume())
     }
 
     fn point(&self, lp: LPARAM) -> (f32, f32) {
@@ -500,6 +618,10 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, x: f32, y: f32) {
+        if self.dragging_volume {
+            self.drag_volume(x);
+            return;
+        }
         if !self.tracking {
             let mut tme = TRACKMOUSEEVENT {
                 cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
@@ -537,7 +659,29 @@ impl App {
         }
     }
 
-    fn on_click(&mut self, x: f32, y: f32) {
+    fn drag_volume(&mut self, x: f32) {
+        if let Some(audio) = &mut self.audio {
+            audio.set_level(ui::volume_fraction(x));
+            self.dirty = true;
+        }
+    }
+
+    fn on_button_down(&mut self, x: f32, y: f32) {
+        self.pressed = self.hit_at(x, y);
+        if self.pressed == Hit::Volume {
+            self.dragging_volume = true;
+            unsafe { SetCapture(self.hwnd) };
+            self.drag_volume(x);
+        }
+    }
+
+    fn on_button_up(&mut self, x: f32, y: f32) {
+        if self.dragging_volume {
+            self.dragging_volume = false;
+            self.pressed = Hit::None;
+            let _ = unsafe { ReleaseCapture() };
+            return;
+        }
         let hit = self.hit_at(x, y);
         if hit != std::mem::take(&mut self.pressed) {
             return;
@@ -557,7 +701,7 @@ impl App {
                 self.info.position = self.info.position_now();
                 self.info.sampled = Some(Instant::now());
                 self.info.playing = !self.info.playing;
-                self.update_progress_timer();
+                self.update_live_timer();
                 self.changed();
             }
             Hit::Seek => {
@@ -565,14 +709,34 @@ impl App {
                 self.media.seek(seconds);
                 self.info.position = seconds;
                 self.info.sampled = Some(Instant::now());
-                self.changed();
+                self.dirty = true;
             }
+            Hit::Mute => {
+                if let Some(audio) = &mut self.audio {
+                    audio.toggle_mute();
+                    self.dirty = true;
+                }
+            }
+            Hit::Volume => {}
             Hit::Drink => {
                 self.drink();
                 if matches!(self.mode, Mode::Activity(Act::Water)) {
                     self.set_timer(TIMER_ACTIVITY, 1200);
                 }
             }
+            Hit::Focus => self.toggle_focus(),
+        }
+    }
+
+    fn on_wheel(&mut self, steps: f32) {
+        let Some(audio) = self.audio.as_mut().filter(|a| a.available()) else {
+            return;
+        };
+        audio.set_level(audio.level + steps * VOLUME_STEP);
+        if self.mode == Mode::Open {
+            self.dirty = true;
+        } else {
+            self.show_level(Act::Volume);
         }
     }
 
@@ -599,7 +763,7 @@ impl App {
             }
             TIMER_COLLAPSE => {
                 self.kill_timer(TIMER_COLLAPSE);
-                if !self.inside && self.mode == Mode::Open {
+                if !self.inside && self.mode == Mode::Open && !self.dragging_volume {
                     self.set_mode(Mode::Closed);
                 }
             }
@@ -620,8 +784,9 @@ impl App {
                 self.set_timer(TIMER_CLOCK, sys::ms_to_next_minute());
                 self.changed();
             }
-            TIMER_PROGRESS => self.dirty = true,
+            TIMER_LIVE => self.dirty = true,
             TIMER_WATER => self.on_water_timer(),
+            TIMER_FOCUS => self.on_focus_timer(),
             _ => {}
         }
     }
@@ -642,33 +807,181 @@ impl App {
         }
         self.info = info;
         let playing = self.playing();
-        if self.media_ready
-            && track_changed
-            && playing
-            && !self.info.title.is_empty()
-            && self.mode == Mode::Closed
-        {
+        let announce = self.media_ready && self.settings.notify_track && track_changed && playing;
+        if announce && !self.info.title.is_empty() && self.mode == Mode::Closed {
             self.show_activity(Act::Track, 3000);
         } else if playing != was_playing && self.mode == Mode::Closed {
             self.retarget();
         }
         self.media_ready = true;
-        self.update_progress_timer();
+        self.update_live_timer();
         // Timeline ticks only matter when the progress bar is on screen.
-        if changed & !media::CHANGED_TIMELINE != 0 || self.mode == Mode::Open {
+        if changed & !media::CHANGED_TIMELINE != 0 {
             self.changed();
+        } else if self.mode == Mode::Open {
+            self.dirty = true;
+        }
+    }
+
+    fn on_audio(&mut self, kind: usize, data: isize) {
+        let Some(audio) = &mut self.audio else { return };
+        match kind {
+            audio::VOLUME_CHANGED => {
+                let (level, muted) = audio::unpack(data);
+                if (audio.level - level).abs() < 0.0005 && audio.muted == muted {
+                    return; // our own change, already on screen
+                }
+                audio.level = level;
+                audio.muted = muted;
+                if self.mode == Mode::Open {
+                    self.dirty = true;
+                } else if self.settings.notify_volume {
+                    self.show_level(Act::Volume);
+                }
+            }
+            audio::DEVICE_CHANGED => {
+                let old = std::mem::take(&mut audio.device);
+                audio.bind();
+                let name = audio.device.clone();
+                if self.settings.notify_audio && !name.is_empty() && name != old {
+                    self.show_activity(Act::Device, 2500);
+                }
+                self.changed();
+            }
+            _ => {}
+        }
+    }
+
+    fn on_brightness(&mut self, value: u8) {
+        // Windows sends the current value right after registering: not a change.
+        let previous = self.brightness.replace(value);
+        if previous.is_some_and(|p| p != value) && self.settings.notify_brightness {
+            self.show_level(Act::Brightness);
+        }
+    }
+
+    fn on_privacy(&mut self) {
+        let Some(now) = self
+            .privacy
+            .as_ref()
+            .and_then(|s| s.lock().ok().map(|s| s.clone()))
+        else {
+            return;
+        };
+        let started = match (&now.cam, &now.mic) {
+            (Some(app), _) if self.in_use.cam.is_none() => Some((true, app.clone())),
+            (_, Some(app)) if self.in_use.mic.is_none() => Some((false, app.clone())),
+            _ => None,
+        };
+        self.in_use = now;
+        if !self.settings.notify_privacy {
+            return;
+        }
+        if let Some(shown) = started {
+            self.privacy_shown = shown;
+            self.show_activity(Act::Privacy, 2500);
+        } else if self.mode == Mode::Closed {
+            // The dot appeared or went away: the pill changes width.
+            self.retarget();
+        }
+        self.changed();
+    }
+
+    fn on_foreground(&mut self) {
+        if !self.settings.monitor_active {
+            return;
+        }
+        if let Some(monitor) = sys::active_monitor().filter(|&m| m != self.monitor) {
+            self.monitor = monitor;
+            self.place();
         }
     }
 
     fn on_power(&mut self) {
         let old = self.power;
-        self.power = sys::power();
-        if self.power.has_battery && self.power.on_ac != old.on_ac {
-            self.show_activity(Act::Power, 3500);
+        let p = sys::power();
+        self.power = p;
+        if p.on_ac {
+            self.low_warned = 100;
+        } else {
+            self.full_notified = false;
         }
-        if self.power != old {
+        if p.has_battery && self.settings.notify_battery {
+            let event = if p.on_ac != old.on_ac {
+                // Plugging in an already full battery: "plugged in" says enough.
+                self.full_notified |= p.on_ac && p.percent >= 100;
+                Some(if p.on_ac {
+                    PowerEvent::Plugged
+                } else {
+                    PowerEvent::Unplugged
+                })
+            } else if !p.on_ac && p.percent <= 10 && self.low_warned > 10 {
+                self.low_warned = 10;
+                Some(PowerEvent::Low)
+            } else if !p.on_ac && p.percent <= 20 && self.low_warned > 20 {
+                self.low_warned = 20;
+                Some(PowerEvent::Low)
+            } else if p.on_ac && p.percent >= 100 && !self.full_notified {
+                self.full_notified = true;
+                Some(PowerEvent::Full)
+            } else {
+                None
+            };
+            if let Some(event) = event {
+                self.power_event = event;
+                self.show_activity(Act::Power, 3500);
+            }
+        }
+        if p != old {
             self.changed();
         }
+    }
+
+    // ---- pomodoro ----
+
+    fn toggle_focus(&mut self) {
+        if self.focus.phase().is_some() {
+            self.focus.stop();
+            self.kill_timer(TIMER_FOCUS);
+        } else {
+            self.focus.start(Phase::Focus, self.settings.focus_min);
+            self.arm_focus();
+        }
+        self.update_live_timer();
+        self.changed();
+    }
+
+    fn arm_focus(&self) {
+        if let Some(ms) = self.focus.next_tick_ms() {
+            self.set_timer(TIMER_FOCUS, ms + 20);
+        }
+    }
+
+    fn on_focus_timer(&mut self) {
+        self.kill_timer(TIMER_FOCUS);
+        match self.focus.remaining() {
+            None => {}
+            Some(left) if left.as_millis() <= 300 => self.focus_phase_done(),
+            Some(_) => {
+                self.arm_focus();
+                self.changed();
+            }
+        }
+    }
+
+    fn focus_phase_done(&mut self) {
+        sys::chime();
+        if self.focus.phase() == Some(Phase::Focus) {
+            self.focus.start(Phase::Rest, self.settings.break_min);
+            self.focus_note = format!("{} · {} min", self.text.focus_done, self.settings.break_min);
+            self.arm_focus();
+        } else {
+            self.focus.stop();
+            self.focus_note = self.text.rest_done.to_string();
+        }
+        self.show_activity(Act::Focus, 5000);
+        self.update_live_timer();
+        self.changed();
     }
 
     // ---- water ----
@@ -715,12 +1028,27 @@ impl App {
     // ---- tray menu ----
 
     pub fn menu_state(&self) -> MenuState {
+        let s = &self.settings;
         MenuState {
             autostart: sys::autostart_enabled(),
-            water_enabled: self.settings.water_enabled,
-            interval: self.settings.water_interval,
-            goal: self.settings.water_goal,
-            glass: self.settings.water_glass,
+            hidden: s.hidden,
+            monitor_active: s.monitor_active,
+            hotkey: s.hotkey,
+            alerts: [
+                s.notify_track,
+                s.notify_volume,
+                s.notify_brightness,
+                s.notify_audio,
+                s.notify_battery,
+                s.notify_privacy,
+            ],
+            water_enabled: s.water_enabled,
+            interval: s.water_interval,
+            goal: s.water_goal,
+            glass: s.water_glass,
+            focus_running: self.focus.phase().is_some(),
+            focus_min: s.focus_min,
+            rest_min: s.break_min,
             text: self.text,
         }
     }
@@ -737,14 +1065,58 @@ impl App {
                 unsafe { PostQuitMessage(0) };
                 return;
             }
+            MenuCmd::FocusToggle => {
+                self.toggle_focus();
+                return;
+            }
+            MenuCmd::Hidden => s.hidden = !s.hidden,
+            MenuCmd::Monitor(active) => s.monitor_active = active,
+            MenuCmd::Hotkey => {
+                s.hotkey = !s.hotkey;
+                sys::set_hotkey(self.hwnd, s.hotkey);
+            }
+            MenuCmd::Alert(alert) => {
+                let flag = match alert {
+                    Alert::Track => &mut s.notify_track,
+                    Alert::Volume => &mut s.notify_volume,
+                    Alert::Brightness => &mut s.notify_brightness,
+                    Alert::Audio => &mut s.notify_audio,
+                    Alert::Battery => &mut s.notify_battery,
+                    Alert::Privacy => &mut s.notify_privacy,
+                };
+                *flag = !*flag;
+            }
             MenuCmd::WaterToggle => s.water_enabled = !s.water_enabled,
             MenuCmd::Interval(m) => s.water_interval = m,
             MenuCmd::Goal(g) => s.water_goal = g,
             MenuCmd::Glass(g) => s.water_glass = g,
             MenuCmd::ResetWater => s.water_ml = 0,
+            MenuCmd::FocusLength(m) => s.focus_min = m,
+            MenuCmd::RestLength(m) => s.break_min = m,
         }
         self.settings.save();
+        self.apply_settings();
+    }
+
+    /// Starts or stops whatever depends on the settings that may have changed.
+    fn apply_settings(&mut self) {
+        if self.settings.notify_privacy && self.privacy.is_none() {
+            self.privacy = Some(privacy::start(self.hwnd, WM_APP_PRIVACY));
+        }
+        match (self.settings.monitor_active, self.foreground_hook) {
+            (true, None) => {
+                self.foreground_hook = Some(sys::watch_foreground(self.hwnd, WM_APP_FOREGROUND));
+                self.on_foreground();
+            }
+            (false, Some(hook)) => {
+                sys::unwatch_foreground(hook);
+                self.foreground_hook = None;
+                self.place();
+            }
+            _ => {}
+        }
         self.schedule_water();
+        self.retarget();
         self.changed();
     }
 
@@ -766,19 +1138,28 @@ impl App {
             }
             WM_LBUTTONDOWN => {
                 let (x, y) = self.point(lp);
-                self.pressed = self.hit_at(x, y);
+                self.on_button_down(x, y);
             }
             WM_LBUTTONUP => {
                 let (x, y) = self.point(lp);
-                self.on_click(x, y);
+                self.on_button_up(x, y);
+            }
+            WM_CAPTURECHANGED => self.dragging_volume = false,
+            WM_MOUSEWHEEL => {
+                let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as f32 / WHEEL_DELTA as f32;
+                self.on_wheel(delta);
             }
             WM_MOUSEACTIVATE => return Some(LRESULT(MA_NOACTIVATE as isize)),
             WM_SETCURSOR if self.hot != Hit::None => {
                 unsafe { SetCursor(LoadCursorW(None, IDC_HAND).ok()) };
                 return Some(LRESULT(1));
             }
+            WM_HOTKEY => self.on_tray_click(),
             WM_TIMER => self.on_timer(wp.0),
             WM_APP_MEDIA => self.on_media(wp.0),
+            WM_APP_AUDIO => self.on_audio(wp.0, lp.0),
+            WM_APP_PRIVACY => self.on_privacy(),
+            WM_APP_FOREGROUND => self.on_foreground(),
             WM_APP_TRAY => {
                 let event = lp.0 as u32 & 0xFFFF;
                 if event == NIN_SELECT || event == NIN_KEYSELECT {
@@ -794,11 +1175,25 @@ impl App {
                 }
             }
             WM_POWERBROADCAST => {
-                if matches!(
-                    wp.0 as u32,
-                    PBT_APMPOWERSTATUSCHANGE | PBT_POWERSETTINGCHANGE
-                ) {
-                    self.on_power();
+                match wp.0 as u32 {
+                    PBT_APMPOWERSTATUSCHANGE => self.on_power(),
+                    PBT_POWERSETTINGCHANGE => {
+                        let setting = unsafe { (lp.0 as *const POWERBROADCAST_SETTING).as_ref() };
+                        match setting {
+                            Some(s)
+                                if s.PowerSetting == GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS
+                                    && s.DataLength >= 4 =>
+                            {
+                                let value = unsafe {
+                                    std::ptr::read_unaligned(s.Data.as_ptr() as *const u32)
+                                };
+                                self.on_brightness(value.min(100) as u8);
+                            }
+                            Some(_) => self.on_power(),
+                            None => {}
+                        }
+                    }
+                    _ => {}
                 }
                 return Some(LRESULT(1));
             }

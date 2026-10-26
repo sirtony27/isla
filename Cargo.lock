@@ -4,9 +4,10 @@ version = 4
 
 [[package]]
 name = "isla"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows",
+ "windows-core",
  "windows-future",
  "windows-numerics",
 ]

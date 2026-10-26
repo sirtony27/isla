@@ -1,18 +1,31 @@
 //! Thin wrappers over the Win32 calls that are not about drawing.
 
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE};
+use windows::Win32::Foundation::{
+    GetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HWND, LPARAM, POINT, WPARAM,
+};
 use windows::Win32::Globalization::{
     GetDateFormatEx, GetTimeFormatEx, ENUM_DATE_FORMATS_FLAGS, TIME_NOSECONDS,
 };
+use windows::Win32::Graphics::Gdi::{
+    MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTOPRIMARY,
+};
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_NOREPEAT, MOD_WIN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, MessageBoxW, MB_ICONERROR,
+    GetClassNameW, GetForegroundWindow, MessageBoxW, PostMessageW, EVENT_SYSTEM_FOREGROUND,
+    MB_ICONASTERISK, MB_ICONERROR, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -145,8 +158,91 @@ pub fn ms_to_next_minute() -> u32 {
 
 /// The desktop itself counts as "full screen" for the shell; we don't want to hide for it.
 pub fn desktop_is_foreground() -> bool {
-    let mut buf = [0u16; 32];
-    let n = unsafe { GetClassNameW(GetForegroundWindow(), &mut buf) };
-    let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-    class == "Progman" || class == "WorkerW"
+    matches!(
+        class_of(unsafe { GetForegroundWindow() }).as_str(),
+        "Progman" | "WorkerW"
+    )
+}
+
+fn class_of(hwnd: HWND) -> String {
+    let mut buf = [0u16; 64];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// The Windows "asterisk" sound, from the user's sound scheme.
+pub fn chime() {
+    let _ = unsafe { MessageBeep(MB_ICONASTERISK) };
+}
+
+const HOTKEY_ID: i32 = 1;
+
+/// Win+Alt+N. `RegisterHotKey` only reports that combination; it does not see other keys.
+pub fn set_hotkey(hwnd: HWND, enabled: bool) {
+    unsafe {
+        if enabled {
+            let _ = RegisterHotKey(
+                Some(hwnd),
+                HOTKEY_ID,
+                MOD_WIN | MOD_ALT | MOD_NOREPEAT,
+                'N' as u32,
+            );
+        } else {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+        }
+    }
+}
+
+pub fn primary_monitor() -> HMONITOR {
+    unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) }
+}
+
+/// Monitor of the active window, ignoring the desktop and the taskbar
+/// (they span or belong to every monitor and would make the notch jump).
+pub fn active_monitor() -> Option<HMONITOR> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    let shell = matches!(
+        class_of(hwnd).as_str(),
+        "" | "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+    );
+    (!shell).then(|| unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) })
+}
+
+static FOREGROUND_TARGET: AtomicIsize = AtomicIsize::new(0);
+static FOREGROUND_MESSAGE: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "system" fn on_foreground(
+    _: HWINEVENTHOOK,
+    _: u32,
+    _: HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
+    let hwnd = HWND(FOREGROUND_TARGET.load(Ordering::Relaxed) as _);
+    let message = FOREGROUND_MESSAGE.load(Ordering::Relaxed);
+    let _ = unsafe { PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0)) };
+}
+
+/// Posts `message` to `hwnd` whenever another app's window becomes active.
+/// An out-of-context accessibility event: no code is injected into other processes.
+pub fn watch_foreground(hwnd: HWND, message: u32) -> HWINEVENTHOOK {
+    FOREGROUND_TARGET.store(hwnd.0 as isize, Ordering::Relaxed);
+    FOREGROUND_MESSAGE.store(message, Ordering::Relaxed);
+    unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(on_foreground),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
+    }
+}
+
+pub fn unwatch_foreground(hook: HWINEVENTHOOK) {
+    let _ = unsafe { UnhookWinEvent(hook) };
 }
