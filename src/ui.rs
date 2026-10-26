@@ -1,15 +1,18 @@
 //! Layout, drawing and hit-testing of every view. All coordinates are DIPs
 //! relative to the window; the notch is anchored to the top center.
 
+use std::f32::consts::PI;
+
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
-    D2D_RECT_F, D2D_SIZE_F,
+    D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW,
+    D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D_RECT_F, D2D_SIZE_F,
 };
 use windows::Win32::Graphics::Direct2D::{
     ID2D1Bitmap1, ID2D1BitmapBrush1, ID2D1GeometrySink, ID2D1PathGeometry1, ID2D1StrokeStyle,
-    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT,
-    D2D1_SWEEP_DIRECTION, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE, D2D1_ARC_SIZE_LARGE,
+    D2D1_ARC_SIZE_SMALL, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_INTERPOLATION_MODE_LINEAR,
+    D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION, D2D1_SWEEP_DIRECTION_CLOCKWISE,
+    D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
 };
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteTextFormat, DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_ALIGNMENT,
@@ -17,6 +20,7 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows_numerics::{Matrix3x2, Vector2};
 
+use crate::focus::{self, Focus, Phase};
 use crate::gfx::{Fonts, Gfx};
 use crate::i18n::Text;
 use crate::media::{Info, ART_SIZE};
@@ -25,15 +29,20 @@ use crate::sys::Power;
 /// The window is fixed at this size; the notch animates inside it and the
 /// window region follows the notch so clicks elsewhere pass through.
 pub const WIN_W: f32 = 460.0;
-pub const WIN_H: f32 = 196.0;
+pub const WIN_H: f32 = 236.0;
 pub const CX: f32 = WIN_W / 2.0;
 /// Concave curve joining the notch to the top edge of the screen.
 pub const FLARE: f32 = 8.0;
+/// Height of the invisible strip that opens the notch in "alerts only" mode.
+pub const HOT_STRIP: f32 = 4.0;
 
 const WHITE: u32 = 0xFFFFFF;
 const GREEN: u32 = 0x34C759;
 const RED: u32 = 0xFF453A;
 const BLUE: u32 = 0x5AC8FA;
+const CORAL: u32 = 0xFF7A59;
+pub const MIC_COLOR: u32 = 0xFF9F0A;
+pub const CAM_COLOR: u32 = 0x30D158;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Hit {
@@ -43,7 +52,10 @@ pub enum Hit {
     Play,
     Next,
     Seek,
+    Mute,
+    Volume,
     Drink,
+    Focus,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,6 +63,11 @@ pub enum Act {
     Power,
     Track,
     Water,
+    Volume,
+    Brightness,
+    Device,
+    Privacy,
+    Focus,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,15 +77,49 @@ pub enum Mode {
     Activity(Act),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum PowerEvent {
+    #[default]
+    Plugged,
+    Unplugged,
+    Low,
+    Full,
+}
+
+/// What shapes the closed pill.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct Look {
+    pub playing: bool,
+    pub hidden: bool,
+    /// Privacy dot color while the microphone or camera is in use.
+    pub dot: Option<u32>,
+}
+
 /// Target (width, height, corner radius) of the notch for a mode.
-pub fn size_for(mode: Mode, playing: bool) -> (f32, f32, f32) {
+pub fn size_for(mode: Mode, look: Look) -> (f32, f32, f32) {
     match mode {
-        Mode::Closed if playing => (220.0, 30.0, 12.0),
-        Mode::Closed => (180.0, 30.0, 12.0),
-        Mode::Open => (420.0, 176.0, 30.0),
-        Mode::Activity(Act::Power) => (300.0, 36.0, 15.0),
+        Mode::Closed if look.hidden && look.dot.is_none() => (160.0, 0.0, 0.0),
+        Mode::Closed if look.hidden => (40.0, 22.0, 11.0),
+        Mode::Closed => {
+            let w = 180.0
+                + if look.playing { 40.0 } else { 0.0 }
+                + if look.dot.is_some() { 18.0 } else { 0.0 };
+            (w, 30.0, 12.0)
+        }
+        Mode::Open => (420.0, 212.0, 30.0),
+        Mode::Activity(Act::Power | Act::Focus) => (300.0, 36.0, 15.0),
         Mode::Activity(Act::Track) => (340.0, 40.0, 17.0),
         Mode::Activity(Act::Water) => (380.0, 64.0, 24.0),
+        Mode::Activity(Act::Volume | Act::Brightness) => (280.0, 36.0, 15.0),
+        Mode::Activity(Act::Device) => (330.0, 40.0, 17.0),
+        Mode::Activity(Act::Privacy) => (310.0, 36.0, 15.0),
+    }
+}
+
+pub fn phase_color(phase: Phase) -> u32 {
+    match phase {
+        Phase::Focus => CORAL,
+        Phase::Rest => GREEN,
     }
 }
 
@@ -115,13 +166,16 @@ struct OpenLayout {
     next: Rect,
     bar: Rect,
     times: Rect,
+    mute: Rect,
+    volume: Rect,
+    volume_text: Rect,
     water: Rect,
-    drink: Rect,
+    focus: Rect,
     battery: Rect,
 }
 
 fn open_layout() -> OpenLayout {
-    let (w, _, _) = size_for(Mode::Open, false);
+    let (w, _, _) = size_for(Mode::Open, Look::default());
     let (x0, x1, pad) = (CX - w / 2.0, CX + w / 2.0, 18.0);
     let art = Rect::new(x0 + pad, 16.0, 64.0, 64.0);
     let cy = art.cy();
@@ -131,8 +185,16 @@ fn open_layout() -> OpenLayout {
     let tx = art.right() + 14.0;
     let tw = prev.x - 10.0 - tx;
     let bar = Rect::new(x0 + pad, 94.0, w - 2.0 * pad, 4.0);
-    let card_w = (w - 2.0 * pad - 10.0) / 2.0;
-    let water = Rect::new(x0 + pad, 124.0, card_w, 38.0);
+    let mute = Rect::new(x0 + pad - 4.0, 122.0, 26.0, 22.0);
+    let volume = Rect::new(
+        mute.right() + 4.0,
+        131.0,
+        x1 - pad - 46.0 - (mute.right() + 4.0),
+        4.0,
+    );
+    let card_w = (w - 2.0 * pad - 20.0) / 3.0;
+    let water = Rect::new(x0 + pad, 154.0, card_w, 44.0);
+    let focus = Rect::new(water.right() + 10.0, water.y, card_w, water.h);
     OpenLayout {
         art,
         title: Rect::new(tx, art.y + 9.0, tw, 22.0),
@@ -142,18 +204,21 @@ fn open_layout() -> OpenLayout {
         next,
         bar,
         times: Rect::new(bar.x, 101.0, bar.w, 14.0),
+        mute,
+        volume,
+        volume_text: Rect::new(x1 - pad - 40.0, 122.0, 40.0, 22.0),
         water,
-        drink: Rect::new(water.right() - 8.0 - 58.0, water.y + 7.0, 58.0, 24.0),
-        battery: Rect::new(water.right() + 10.0, water.y, card_w, water.h),
+        focus,
+        battery: Rect::new(focus.right() + 10.0, water.y, card_w, water.h),
     }
 }
 
 fn water_button() -> Rect {
-    let (w, _, _) = size_for(Mode::Activity(Act::Water), false);
+    let (w, _, _) = size_for(Mode::Activity(Act::Water), Look::default());
     Rect::new(CX + w / 2.0 - 16.0 - 88.0, 17.0, 88.0, 30.0)
 }
 
-pub fn hit(mode: Mode, x: f32, y: f32, info: &Info) -> Hit {
+pub fn hit(mode: Mode, x: f32, y: f32, info: &Info, has_volume: bool) -> Hit {
     match mode {
         Mode::Open => {
             let l = open_layout();
@@ -173,8 +238,19 @@ pub fn hit(mode: Mode, x: f32, y: f32, info: &Info) -> Hit {
                     return Hit::Seek;
                 }
             }
-            if l.drink.contains(x, y) {
+            if has_volume {
+                if l.mute.contains(x, y) {
+                    return Hit::Mute;
+                }
+                if Rect::new(l.volume.x - 6.0, 122.0, l.volume.w + 12.0, 22.0).contains(x, y) {
+                    return Hit::Volume;
+                }
+            }
+            if l.water.contains(x, y) {
                 return Hit::Drink;
+            }
+            if l.focus.contains(x, y) {
+                return Hit::Focus;
             }
             Hit::None
         }
@@ -189,6 +265,12 @@ pub fn seek_fraction(x: f32) -> f64 {
     ((x - bar.x) / bar.w).clamp(0.0, 1.0) as f64
 }
 
+/// Volume (0..=1) under `x` on the volume bar.
+pub fn volume_fraction(x: f32) -> f32 {
+    let bar = open_layout().volume;
+    ((x - bar.x) / bar.w).clamp(0.0, 1.0)
+}
+
 /// Everything a frame needs, borrowed from the app for the duration of the draw.
 pub struct View<'a> {
     pub w: f32,
@@ -198,15 +280,25 @@ pub struct View<'a> {
     pub a_open: f32,
     pub a_act: f32,
     pub act: Act,
-    pub playing: bool,
+    pub look: Look,
     pub info: &'a Info,
     pub art: Option<&'a ID2D1BitmapBrush1>,
     pub clock: &'a str,
     pub date: &'a str,
     pub power: Power,
+    pub power_event: PowerEvent,
     pub water_ml: u32,
     pub water_goal: u32,
     pub glass: u32,
+    /// Volume (0..=1) and mute, if there is an output device.
+    pub volume: Option<(f32, bool)>,
+    pub brightness: u8,
+    pub device: &'a str,
+    /// Camera (true) or microphone (false) and the app using it, for the activity.
+    pub privacy: (bool, &'a str),
+    pub focus: Focus,
+    pub focus_min: u32,
+    pub focus_note: &'a str,
     pub hot: Hit,
     pub text: &'a Text,
     pub fonts: &'a Fonts,
@@ -214,7 +306,8 @@ pub struct View<'a> {
 
 /// Each view (closed, open, activity) is drawn once into its own cached
 /// bitmap and only redrawn when its content changes. Animation frames just
-/// compose those bitmaps, which keeps each frame cheap.
+/// compose those bitmaps, which keeps each frame cheap. Parts that change
+/// every second (progress, volume, timer) are drawn live on top.
 #[derive(Default)]
 pub struct Layers {
     slots: [Layer; 3],
@@ -250,7 +343,7 @@ fn layer_rect(kind: usize, v: &View) -> Rect {
         OPEN => Mode::Open,
         _ => Mode::Activity(v.act),
     };
-    let (w, h, _) = size_for(mode, v.playing);
+    let (w, h, _) = size_for(mode, v.look);
     Rect::new(CX - w / 2.0, 0.0, w, h)
 }
 
@@ -266,13 +359,17 @@ pub fn prepare(g: &Gfx, v: &View, layers: &mut Layers, dpi: f32) -> windows::cor
         let ox = (r.x * scale).floor() as i32;
         let pw = ((r.x + r.w) * scale).ceil() as i32 - ox;
         let ph = (r.h * scale).ceil() as i32;
+        let slot = &mut layers.slots[kind];
+        if pw <= 0 || ph <= 0 {
+            slot.valid = false;
+            continue;
+        }
         let act = if kind == OPEN || kind == CLOSED {
             0
         } else {
             v.act as u8 + 1
         };
         let key = (ox, pw, ph, act);
-        let slot = &mut layers.slots[kind];
         if slot.bitmap.is_none() || slot.key != key {
             slot.bitmap = g.layer(pw as u32, ph as u32, dpi);
             slot.key = key;
@@ -284,11 +381,7 @@ pub fn prepare(g: &Gfx, v: &View, layers: &mut Layers, dpi: f32) -> windows::cor
                 match kind {
                     CLOSED => draw_closed(&p, v),
                     OPEN => draw_open(&p, v),
-                    _ => match v.act {
-                        Act::Power => draw_power(&p, v),
-                        Act::Track => draw_track(&p, v),
-                        Act::Water => draw_water(&p, v),
-                    },
+                    _ => draw_activity(&p, v),
                 }
             })?;
             slot.valid = true;
@@ -301,9 +394,11 @@ pub fn prepare(g: &Gfx, v: &View, layers: &mut Layers, dpi: f32) -> windows::cor
 pub fn compose(g: &Gfx, v: &View, layers: &Layers, dpi: f32) {
     let scale = dpi / 96.0;
     let p = Painter { g, alpha: 1.0 };
-    if let Some(shape) = p.geometry(|s| notch_path(s, v.w, v.h, v.r)) {
-        p.color(0x000000, 1.0);
-        unsafe { g.ctx.FillGeometry(&shape, &g.brush, None) };
+    if v.h > 0.5 {
+        if let Some(shape) = p.geometry(|s| notch_path(s, v.w, v.h, v.r)) {
+            p.color(0x000000, 1.0);
+            unsafe { g.ctx.FillGeometry(&shape, &g.brush, None) };
+        }
     }
     let clip = Rect::new(CX - v.w / 2.0, 0.0, v.w, v.h).d2d();
     unsafe {
@@ -342,9 +437,11 @@ pub fn compose(g: &Gfx, v: &View, layers: &Layers, dpi: f32) {
                 None,
             );
         }
-        if kind == OPEN {
-            // The progress bar changes every second; it is drawn live on top.
-            draw_progress(&Painter { g, alpha }, v);
+        let p = Painter { g, alpha };
+        match kind {
+            CLOSED => {}
+            OPEN => draw_open_live(&p, v),
+            _ => draw_activity_live(&p, v),
         }
         unsafe { g.ctx.SetTransform(&Matrix3x2::identity()) };
     }
@@ -355,7 +452,14 @@ fn v2(x: f32, y: f32) -> Vector2 {
     Vector2 { X: x, Y: y }
 }
 
-fn arc(s: &ID2D1GeometrySink, x: f32, y: f32, r: f32, dir: D2D1_SWEEP_DIRECTION) {
+fn arc_to(
+    s: &ID2D1GeometrySink,
+    x: f32,
+    y: f32,
+    r: f32,
+    dir: D2D1_SWEEP_DIRECTION,
+    size: D2D1_ARC_SIZE,
+) {
     unsafe {
         s.AddArc(&D2D1_ARC_SEGMENT {
             point: v2(x, y),
@@ -365,9 +469,19 @@ fn arc(s: &ID2D1GeometrySink, x: f32, y: f32, r: f32, dir: D2D1_SWEEP_DIRECTION)
             },
             rotationAngle: 0.0,
             sweepDirection: dir,
-            arcSize: D2D1_ARC_SIZE_SMALL,
+            arcSize: size,
         });
     }
+}
+
+fn arc(s: &ID2D1GeometrySink, x: f32, y: f32, r: f32, dir: D2D1_SWEEP_DIRECTION) {
+    arc_to(s, x, y, r, dir, D2D1_ARC_SIZE_SMALL);
+}
+
+/// Point at `deg` degrees on a circle; 0° is to the right, angles grow clockwise on screen.
+fn polar(cx: f32, cy: f32, r: f32, deg: f32) -> (f32, f32) {
+    let t = deg * PI / 180.0;
+    (cx + r * t.cos(), cy + r * t.sin())
 }
 
 /// Rectangle flush with the top edge, rounded bottom corners and concave
@@ -391,28 +505,51 @@ fn notch_path(s: &ID2D1GeometrySink, w: f32, h: f32, r: f32) {
 }
 
 fn draw_closed(p: &Painter, v: &View) {
-    let (w, h, _) = size_for(Mode::Closed, v.playing);
-    let x0 = CX - w / 2.0;
-    if v.playing {
-        p.art(v, Rect::new(x0 + 10.0, 6.0, 18.0, 18.0), 5.0);
-        p.bars(
-            Rect::new(x0 + w - 10.0 - 14.0, 9.0, 14.0, 12.0),
-            v.info.accent,
-        );
+    let (w, h, _) = size_for(Mode::Closed, v.look);
+    if v.look.hidden {
+        if let Some(color) = v.look.dot {
+            p.circle(CX, h / 2.0, 4.0, color, 1.0);
+        }
+        return;
     }
-    p.text(
-        v.clock,
-        &v.fonts.clock,
-        Rect::new(CX - 50.0, 0.0, 100.0, h),
-        DWRITE_TEXT_ALIGNMENT_CENTER,
-        WHITE,
-        1.0,
-    );
+    let (x0, x1) = (CX - w / 2.0, CX + w / 2.0);
+    let mut right = x1 - 10.0;
+    if let Some(color) = v.look.dot {
+        p.circle(right - 4.0, h / 2.0, 4.0, color, 1.0);
+        right -= 16.0;
+    }
+    if v.look.playing {
+        p.art(v, Rect::new(x0 + 10.0, 6.0, 18.0, 18.0), 5.0);
+        p.bars(Rect::new(right - 14.0, 9.0, 14.0, 12.0), v.info.accent);
+    }
+    let center = Rect::new(CX - 50.0, 0.0, 100.0, h);
+    match (v.focus.phase(), v.focus.remaining()) {
+        (Some(phase), Some(left)) => {
+            let text = focus::minutes(left);
+            p.text(
+                &text,
+                &v.fonts.clock,
+                center,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+                phase_color(phase),
+                1.0,
+            );
+        }
+        _ => p.text(
+            v.clock,
+            &v.fonts.clock,
+            center,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            WHITE,
+            1.0,
+        ),
+    }
 }
 
 fn draw_open(p: &Painter, v: &View) {
     let l = open_layout();
     let info = v.info;
+    let f = v.fonts;
     p.art(v, l.art, 14.0);
     let (title, artist) = if info.active && !info.title.is_empty() {
         (info.title.as_str(), info.artist.as_str())
@@ -421,7 +558,7 @@ fn draw_open(p: &Painter, v: &View) {
     };
     p.text(
         title,
-        &v.fonts.title,
+        &f.title,
         l.title,
         DWRITE_TEXT_ALIGNMENT_LEADING,
         WHITE,
@@ -429,7 +566,7 @@ fn draw_open(p: &Painter, v: &View) {
     );
     p.text(
         artist,
-        &v.fonts.body,
+        &f.body,
         l.artist,
         DWRITE_TEXT_ALIGNMENT_LEADING,
         WHITE,
@@ -450,53 +587,85 @@ fn draw_open(p: &Painter, v: &View) {
             Hit::Prev => p.skip(rect.cx(), rect.cy(), 13.0, false, a),
             Hit::Next => p.skip(rect.cx(), rect.cy(), 13.0, true, a),
             _ if info.playing => p.pause(rect.cx(), rect.cy(), 17.0, a),
-            _ => p.play(rect.cx() + 1.5, rect.cy(), 17.0, a),
+            _ => p.play(rect.cx() + 1.5, rect.cy(), 17.0, WHITE, a),
         }
     }
 
-    // Water card.
+    // Water card: the whole card adds a glass.
     let c = l.water;
-    p.rrect(c, 12.0, WHITE, 0.07);
-    p.drop(c.x + 18.0, c.cy() - 8.5, 17.0, BLUE, 1.0);
-    let tx = c.x + 34.0;
-    let tw = l.drink.x - 8.0 - tx;
-    let label = format!("{} / {} ml", v.water_ml, v.water_goal);
+    let hot = v.hot == Hit::Drink;
+    p.rrect(c, 12.0, WHITE, if hot { 0.12 } else { 0.07 });
+    p.drop(c.x + 16.0, c.cy() - 8.0, 16.0, BLUE, 1.0);
+    let (tx, tw) = (c.x + 30.0, c.w - 40.0);
+    let amount = v.text.liters_of(v.water_ml, v.water_goal);
     p.text(
-        &label,
-        &v.fonts.label,
-        Rect::new(tx, c.y + 4.0, tw, 18.0),
+        &amount,
+        &f.label,
+        Rect::new(tx, c.y + 5.0, tw, 18.0),
         DWRITE_TEXT_ALIGNMENT_LEADING,
         WHITE,
         1.0,
     );
-    let frac = (v.water_ml as f32 / v.water_goal.max(1) as f32).min(1.0);
-    let track = Rect::new(tx, c.y + 25.0, tw, 4.0);
-    p.rrect(track, 2.0, WHITE, 0.14);
-    p.rrect(Rect::new(tx, track.y, tw * frac, 4.0), 2.0, BLUE, 1.0);
-    let hot = v.hot == Hit::Drink;
-    p.rrect(l.drink, 12.0, BLUE, if hot { 0.38 } else { 0.22 });
-    let glass = format!("+{}", v.glass);
+    if hot {
+        let glass = format!("+{} ml", v.glass);
+        p.text(
+            &glass,
+            &f.small,
+            Rect::new(tx, c.y + 23.0, tw, 14.0),
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            BLUE,
+            1.0,
+        );
+    } else {
+        let frac = (v.water_ml as f32 / v.water_goal.max(1) as f32).min(1.0);
+        let track = Rect::new(tx, c.y + 29.0, tw, 3.0);
+        p.rrect(track, 1.5, WHITE, 0.14);
+        p.rrect(Rect::new(tx, track.y, tw * frac, 3.0), 1.5, BLUE, 1.0);
+    }
+
+    // Focus card: click to start or stop. The running clock is drawn live.
+    let c = l.focus;
+    let hot = v.hot == Hit::Focus;
+    p.rrect(c, 12.0, WHITE, if hot { 0.12 } else { 0.07 });
+    let sub = match v.focus.phase() {
+        None => v.text.pomodoro,
+        Some(Phase::Focus) => v.text.focus,
+        Some(Phase::Rest) => v.text.rest,
+    };
     p.text(
-        &glass,
-        &v.fonts.label,
-        l.drink,
-        DWRITE_TEXT_ALIGNMENT_CENTER,
-        BLUE,
-        1.0,
+        sub,
+        &f.small,
+        Rect::new(tx_of(c), c.y + 23.0, c.w - 40.0, 14.0),
+        DWRITE_TEXT_ALIGNMENT_LEADING,
+        WHITE,
+        0.5,
     );
+    if v.focus.phase().is_none() {
+        p.ring(c.x + 16.0, c.cy(), 7.0, 0.0, WHITE);
+        p.play(c.x + 16.8, c.cy(), 6.0, WHITE, 0.8);
+        let length = format!("{:02}:00", v.focus_min);
+        let r = Rect::new(tx_of(c), c.y + 5.0, c.w - 40.0, 18.0);
+        p.text(
+            &length,
+            &f.label,
+            r,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            WHITE,
+            1.0,
+        );
+    }
 
     // Battery card (date card on desktops).
     let c = l.battery;
     p.rrect(c, 12.0, WHITE, 0.07);
-    let tx = c.x + 50.0;
-    let tw = c.right() - 10.0 - tx;
     if v.power.has_battery {
-        p.battery(Rect::new(c.x + 14.0, c.cy() - 6.0, 24.0, 12.0), v.power);
+        p.battery(Rect::new(c.x + 11.0, c.cy() - 5.5, 22.0, 11.0), v.power);
+        let (tx, tw) = (c.x + 41.0, c.w - 48.0);
         let pct = format!("{}%", v.power.percent);
         p.text(
             &pct,
-            &v.fonts.label,
-            Rect::new(tx, c.y + 3.0, tw, 18.0),
+            &f.label,
+            Rect::new(tx, c.y + 5.0, tw, 18.0),
             DWRITE_TEXT_ALIGNMENT_LEADING,
             WHITE,
             1.0,
@@ -504,27 +673,26 @@ fn draw_open(p: &Painter, v: &View) {
         let status = power_status(v.text, v.power);
         p.text(
             status,
-            &v.fonts.small,
-            Rect::new(tx, c.y + 20.0, tw, 14.0),
+            &f.small,
+            Rect::new(tx, c.y + 23.0, tw, 14.0),
             DWRITE_TEXT_ALIGNMENT_LEADING,
             WHITE,
             0.5,
         );
     } else {
-        let r = Rect::new(c.x + 14.0, c.y + 3.0, c.w - 28.0, 18.0);
+        let (tx, tw) = (c.x + 12.0, c.w - 20.0);
         p.text(
             v.date,
-            &v.fonts.label,
-            r,
+            &f.label,
+            Rect::new(tx, c.y + 5.0, tw, 18.0),
             DWRITE_TEXT_ALIGNMENT_LEADING,
             WHITE,
             1.0,
         );
-        let r = Rect::new(c.x + 14.0, c.y + 20.0, c.w - 28.0, 14.0);
         p.text(
             v.clock,
-            &v.fonts.small,
-            r,
+            &f.small,
+            Rect::new(tx, c.y + 23.0, tw, 14.0),
             DWRITE_TEXT_ALIGNMENT_LEADING,
             WHITE,
             0.5,
@@ -532,12 +700,59 @@ fn draw_open(p: &Painter, v: &View) {
     }
 }
 
-fn draw_progress(p: &Painter, v: &View) {
+fn tx_of(card: Rect) -> f32 {
+    card.x + 30.0
+}
+
+fn draw_open_live(p: &Painter, v: &View) {
+    let l = open_layout();
+    draw_progress(p, v, &l);
+    if let Some((level, muted)) = v.volume {
+        if v.hot == Hit::Mute {
+            p.circle(l.mute.cx(), l.mute.cy(), 11.0, WHITE, 0.12);
+        }
+        p.speaker(l.mute.cx() - 7.0, l.mute.cy(), level, muted, 0.9);
+        let mut bar = l.volume;
+        if v.hot == Hit::Volume {
+            bar = Rect::new(bar.x, bar.y - 1.5, bar.w, bar.h + 3.0);
+        }
+        p.level_bar(bar, if muted { 0.0 } else { level }, WHITE);
+        let pct = format!("{}%", (level * 100.0).round());
+        p.text(
+            &pct,
+            &v.fonts.small,
+            l.volume_text,
+            DWRITE_TEXT_ALIGNMENT_TRAILING,
+            WHITE,
+            0.5,
+        );
+    }
+    if let (Some(phase), Some(left)) = (v.focus.phase(), v.focus.remaining()) {
+        let c = l.focus;
+        p.ring(
+            c.x + 16.0,
+            c.cy(),
+            7.0,
+            v.focus.progress(),
+            phase_color(phase),
+        );
+        let r = Rect::new(tx_of(c), c.y + 5.0, c.w - 40.0, 18.0);
+        p.text(
+            &focus::clock(left),
+            &v.fonts.label,
+            r,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            WHITE,
+            1.0,
+        );
+    }
+}
+
+fn draw_progress(p: &Painter, v: &View, l: &OpenLayout) {
     let info = v.info;
     if !info.active || info.duration <= 0.0 {
         return;
     }
-    let l = open_layout();
     let pos = info.position_now();
     let mut bar = l.bar;
     if v.hot == Hit::Seek {
@@ -575,103 +790,202 @@ fn power_status(t: &Text, p: Power) -> &'static str {
     }
 }
 
-fn draw_power(p: &Painter, v: &View) {
-    let (w, h, _) = size_for(Mode::Activity(Act::Power), false);
-    let (x0, x1) = (CX - w / 2.0, CX + w / 2.0);
-    p.battery(Rect::new(x0 + 18.0, h / 2.0 - 6.0, 24.0, 12.0), v.power);
-    let label = if v.power.on_ac {
-        power_status(v.text, v.power)
-    } else {
-        v.text.unplugged
+fn act_bounds(v: &View) -> (f32, f32, f32) {
+    let (w, h, _) = size_for(Mode::Activity(v.act), v.look);
+    (CX - w / 2.0, CX + w / 2.0, h)
+}
+
+fn draw_activity(p: &Painter, v: &View) {
+    let (x0, x1, h) = act_bounds(v);
+    let f = v.fonts;
+    let full = Rect::new(x0, 0.0, x1 - x0, h);
+    match v.act {
+        Act::Power => {
+            p.battery(Rect::new(x0 + 18.0, h / 2.0 - 6.0, 24.0, 12.0), v.power);
+            let (label, color) = match v.power_event {
+                PowerEvent::Plugged => (
+                    power_status(v.text, v.power),
+                    if v.power.charging { GREEN } else { WHITE },
+                ),
+                PowerEvent::Unplugged => (v.text.unplugged, WHITE),
+                PowerEvent::Low => (v.text.battery_low, RED),
+                PowerEvent::Full => (v.text.battery_full, GREEN),
+            };
+            let r = Rect::new(x0 + 54.0, 0.0, 170.0, h);
+            p.text(
+                label,
+                &f.label,
+                r,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                WHITE,
+                1.0,
+            );
+            let pct = format!("{}%", v.power.percent);
+            let r = Rect::new(x1 - 18.0 - 70.0, 0.0, 70.0, h);
+            p.text(
+                &pct,
+                &f.label,
+                r,
+                DWRITE_TEXT_ALIGNMENT_TRAILING,
+                color,
+                1.0,
+            );
+        }
+        Act::Track => {
+            p.art(v, Rect::new(x0 + 9.0, 6.0, 28.0, 28.0), 7.0);
+            let tw = x1 - 40.0 - (x0 + 46.0);
+            let title = Rect::new(x0 + 46.0, 4.0, tw, 18.0);
+            p.text(
+                &v.info.title,
+                &f.label,
+                title,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                WHITE,
+                1.0,
+            );
+            let artist = Rect::new(x0 + 46.0, 21.0, tw, 15.0);
+            p.text(
+                &v.info.artist,
+                &f.small,
+                artist,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                WHITE,
+                0.55,
+            );
+            p.bars(Rect::new(x1 - 14.0 - 16.0, 13.0, 16.0, 14.0), v.info.accent);
+        }
+        Act::Water => {
+            p.drop(x0 + 30.0, 17.0, 30.0, BLUE, 1.0);
+            let b = water_button();
+            let tw = b.x - 10.0 - (x0 + 58.0);
+            let title = Rect::new(x0 + 58.0, 10.0, tw, 22.0);
+            p.text(
+                v.text.water_title,
+                &f.title,
+                title,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                WHITE,
+                1.0,
+            );
+            let sub = if v.water_ml >= v.water_goal {
+                v.text.water_done.to_string()
+            } else {
+                format!(
+                    "{} / {} ml {}",
+                    v.water_ml, v.water_goal, v.text.water_today
+                )
+            };
+            let r = Rect::new(x0 + 58.0, 33.0, tw, 18.0);
+            p.text(&sub, &f.body, r, DWRITE_TEXT_ALIGNMENT_LEADING, WHITE, 0.55);
+            let hot = v.hot == Hit::Drink;
+            p.rrect(b, b.h / 2.0, BLUE, if hot { 1.0 } else { 0.88 });
+            let label = format!("+{} ml", v.glass);
+            p.text(
+                &label,
+                &f.label,
+                b,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+                0x00151C,
+                1.0,
+            );
+        }
+        Act::Device => {
+            p.headphones(x0 + 24.0, h / 2.0, 0.9);
+            let tw = x1 - 16.0 - (x0 + 46.0);
+            let name = Rect::new(x0 + 46.0, 4.0, tw, 18.0);
+            p.text(
+                v.device,
+                &f.label,
+                name,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                WHITE,
+                1.0,
+            );
+            let sub = Rect::new(x0 + 46.0, 21.0, tw, 15.0);
+            p.text(
+                v.text.audio_output,
+                &f.small,
+                sub,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                WHITE,
+                0.55,
+            );
+        }
+        Act::Privacy => {
+            let (camera, app) = v.privacy;
+            let (label, color) = if camera {
+                (v.text.cam_in_use, CAM_COLOR)
+            } else {
+                (v.text.mic_in_use, MIC_COLOR)
+            };
+            p.circle(x0 + 22.0, h / 2.0, 4.5, color, 1.0);
+            let r = Rect::new(x0 + 38.0, 0.0, 160.0, h);
+            p.text(
+                label,
+                &f.label,
+                r,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                WHITE,
+                1.0,
+            );
+            let r = Rect::new(x1 - 16.0 - 100.0, 0.0, 100.0, h);
+            p.text(
+                app,
+                &f.small,
+                r,
+                DWRITE_TEXT_ALIGNMENT_TRAILING,
+                WHITE,
+                0.55,
+            );
+        }
+        Act::Focus => {
+            let color = match v.focus.phase() {
+                Some(Phase::Rest) => GREEN,
+                _ => CORAL,
+            };
+            p.ring(x0 + 24.0, h / 2.0, 7.0, 1.0, color);
+            let r = Rect::new(x0 + 42.0, 0.0, full.w - 58.0, h);
+            p.text(
+                v.focus_note,
+                &f.label,
+                r,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                WHITE,
+                1.0,
+            );
+        }
+        // Drawn entirely live: the level changes while the activity is on screen.
+        Act::Volume | Act::Brightness => {}
+    }
+}
+
+fn draw_activity_live(p: &Painter, v: &View) {
+    let (x0, x1, h) = act_bounds(v);
+    let (level, muted) = match v.act {
+        Act::Volume => v.volume.unwrap_or((0.0, false)),
+        Act::Brightness => (v.brightness as f32 / 100.0, false),
+        _ => return,
     };
-    p.text(
-        label,
-        &v.fonts.label,
-        Rect::new(x0 + 54.0, 0.0, 150.0, h),
-        DWRITE_TEXT_ALIGNMENT_LEADING,
-        WHITE,
-        1.0,
+    if v.act == Act::Volume {
+        p.speaker(x0 + 16.0, h / 2.0, level, muted, 1.0);
+    } else {
+        p.sun(x0 + 24.0, h / 2.0, 1.0);
+    }
+    let bar = Rect::new(
+        x0 + 46.0,
+        h / 2.0 - 2.0,
+        x1 - 16.0 - 46.0 - (x0 + 46.0),
+        4.0,
     );
-    let color = if v.power.charging { GREEN } else { WHITE };
-    let pct = format!("{}%", v.power.percent);
-    let r = Rect::new(x1 - 18.0 - 70.0, 0.0, 70.0, h);
+    p.level_bar(bar, if muted { 0.0 } else { level }, WHITE);
+    let pct = format!("{}%", (level * 100.0).round());
+    let r = Rect::new(x1 - 16.0 - 40.0, 0.0, 40.0, h);
     p.text(
         &pct,
         &v.fonts.label,
         r,
         DWRITE_TEXT_ALIGNMENT_TRAILING,
-        color,
-        1.0,
-    );
-}
-
-fn draw_track(p: &Painter, v: &View) {
-    let (w, _, _) = size_for(Mode::Activity(Act::Track), false);
-    let (x0, x1) = (CX - w / 2.0, CX + w / 2.0);
-    p.art(v, Rect::new(x0 + 9.0, 6.0, 28.0, 28.0), 7.0);
-    let tw = x1 - 40.0 - (x0 + 46.0);
-    let title = Rect::new(x0 + 46.0, 4.0, tw, 18.0);
-    p.text(
-        &v.info.title,
-        &v.fonts.label,
-        title,
-        DWRITE_TEXT_ALIGNMENT_LEADING,
         WHITE,
-        1.0,
-    );
-    let artist = Rect::new(x0 + 46.0, 21.0, tw, 15.0);
-    p.text(
-        &v.info.artist,
-        &v.fonts.small,
-        artist,
-        DWRITE_TEXT_ALIGNMENT_LEADING,
-        WHITE,
-        0.55,
-    );
-    p.bars(Rect::new(x1 - 14.0 - 16.0, 13.0, 16.0, 14.0), v.info.accent);
-}
-
-fn draw_water(p: &Painter, v: &View) {
-    let (w, _, _) = size_for(Mode::Activity(Act::Water), false);
-    let x0 = CX - w / 2.0;
-    p.drop(x0 + 30.0, 17.0, 30.0, BLUE, 1.0);
-    let b = water_button();
-    let tw = b.x - 10.0 - (x0 + 58.0);
-    let title = Rect::new(x0 + 58.0, 10.0, tw, 22.0);
-    p.text(
-        v.text.water_title,
-        &v.fonts.title,
-        title,
-        DWRITE_TEXT_ALIGNMENT_LEADING,
-        WHITE,
-        1.0,
-    );
-    let sub = if v.water_ml >= v.water_goal {
-        v.text.water_done.to_string()
-    } else {
-        format!(
-            "{} / {} ml {}",
-            v.water_ml, v.water_goal, v.text.water_today
-        )
-    };
-    let r = Rect::new(x0 + 58.0, 33.0, tw, 18.0);
-    p.text(
-        &sub,
-        &v.fonts.body,
-        r,
-        DWRITE_TEXT_ALIGNMENT_LEADING,
-        WHITE,
-        0.55,
-    );
-    let hot = v.hot == Hit::Drink;
-    p.rrect(b, b.h / 2.0, BLUE, if hot { 1.0 } else { 0.88 });
-    let label = format!("+{} ml", v.glass);
-    p.text(
-        &label,
-        &v.fonts.label,
-        b,
-        DWRITE_TEXT_ALIGNMENT_CENTER,
-        0x00151C,
         1.0,
     );
 }
@@ -715,10 +1029,29 @@ impl Painter<'_> {
     fn fill(&self, geo: Option<ID2D1PathGeometry1>, rgb: u32, a: f32) {
         if let Some(geo) = geo {
             self.color(rgb, a);
-            unsafe {
-                self.g.ctx.FillGeometry(&geo, &self.g.brush, None);
-            }
+            unsafe { self.g.ctx.FillGeometry(&geo, &self.g.brush, None) };
         }
+    }
+
+    fn stroke(&self, geo: Option<ID2D1PathGeometry1>, width: f32, rgb: u32, a: f32) {
+        if let Some(geo) = geo {
+            self.color(rgb, a);
+            unsafe {
+                self.g
+                    .ctx
+                    .DrawGeometry(&geo, &self.g.brush, width, &self.g.round)
+            };
+        }
+    }
+
+    fn line(&self, from: (f32, f32), to: (f32, f32), width: f32, rgb: u32, a: f32) {
+        self.color(rgb, a);
+        let (p0, p1) = (v2(from.0, from.1), v2(to.0, to.1));
+        unsafe {
+            self.g
+                .ctx
+                .DrawLine(p0, p1, &self.g.brush, width, &self.g.round)
+        };
     }
 
     fn polygon(&self, pts: &[(f32, f32)], rgb: u32, a: f32) {
@@ -848,11 +1181,17 @@ impl Painter<'_> {
         }
     }
 
-    fn play(&self, cx: f32, cy: f32, size: f32, a: f32) {
+    fn level_bar(&self, bar: Rect, level: f32, rgb: u32) {
+        self.rrect(bar, bar.h / 2.0, WHITE, 0.16);
+        let fill = Rect::new(bar.x, bar.y, bar.w * level.clamp(0.0, 1.0), bar.h);
+        self.rrect(fill, bar.h / 2.0, rgb, 0.95);
+    }
+
+    fn play(&self, cx: f32, cy: f32, size: f32, rgb: u32, a: f32) {
         let (h, w) = (size / 2.0, size * 0.42);
         self.polygon(
             &[(cx - w, cy - h), (cx + w * 1.1, cy), (cx - w, cy + h)],
-            WHITE,
+            rgb,
             a,
         );
     }
@@ -882,6 +1221,104 @@ impl Painter<'_> {
             cx - h * 0.55 - 2.6
         };
         self.rrect(Rect::new(bx, cy - h, 2.6, size), 1.0, WHITE, a);
+    }
+
+    /// Speaker with zero, one or two sound waves depending on the level; a cross when muted.
+    fn speaker(&self, x: f32, cy: f32, level: f32, muted: bool, a: f32) {
+        self.polygon(
+            &[
+                (x, cy - 3.0),
+                (x + 3.5, cy - 3.0),
+                (x + 8.0, cy - 7.0),
+                (x + 8.0, cy + 7.0),
+                (x + 3.5, cy + 3.0),
+                (x, cy + 3.0),
+            ],
+            WHITE,
+            a,
+        );
+        if muted || level <= 0.001 {
+            self.line((x + 11.0, cy - 3.0), (x + 16.0, cy + 3.0), 1.6, WHITE, a);
+            self.line((x + 16.0, cy - 3.0), (x + 11.0, cy + 3.0), 1.6, WHITE, a);
+            return;
+        }
+        let (cx, waves) = (x + 9.0, if level > 0.5 { 2 } else { 1 });
+        for r in [4.0, 7.5].into_iter().take(waves) {
+            let start = polar(cx, cy, r, -45.0);
+            let end = polar(cx, cy, r, 45.0);
+            let geo = self.geometry(|s| unsafe {
+                s.BeginFigure(v2(start.0, start.1), D2D1_FIGURE_BEGIN_HOLLOW);
+                arc(s, end.0, end.1, r, D2D1_SWEEP_DIRECTION_CLOCKWISE);
+                s.EndFigure(D2D1_FIGURE_END_OPEN);
+            });
+            self.stroke(geo, 1.6, WHITE, a);
+        }
+    }
+
+    fn sun(&self, cx: f32, cy: f32, a: f32) {
+        self.circle(cx, cy, 3.4, WHITE, a);
+        for i in 0..8 {
+            let deg = i as f32 * 45.0;
+            self.line(
+                polar(cx, cy, 5.6, deg),
+                polar(cx, cy, 7.6, deg),
+                1.5,
+                WHITE,
+                a,
+            );
+        }
+    }
+
+    fn headphones(&self, cx: f32, cy: f32, a: f32) {
+        let r = 6.5;
+        let base = cy + 1.0;
+        let geo = self.geometry(|s| unsafe {
+            s.BeginFigure(v2(cx - r, base), D2D1_FIGURE_BEGIN_HOLLOW);
+            arc(s, cx, base - r, r, D2D1_SWEEP_DIRECTION_CLOCKWISE);
+            arc(s, cx + r, base, r, D2D1_SWEEP_DIRECTION_CLOCKWISE);
+            s.EndFigure(D2D1_FIGURE_END_OPEN);
+        });
+        self.stroke(geo, 1.8, WHITE, a);
+        self.rrect(Rect::new(cx - r - 1.6, base, 3.6, 6.5), 1.5, WHITE, a);
+        self.rrect(Rect::new(cx + r - 2.0, base, 3.6, 6.5), 1.5, WHITE, a);
+    }
+
+    /// Progress ring starting at 12 o'clock, clockwise.
+    fn ring(&self, cx: f32, cy: f32, r: f32, progress: f32, rgb: u32) {
+        let e = D2D1_ELLIPSE {
+            point: v2(cx, cy),
+            radiusX: r,
+            radiusY: r,
+        };
+        self.color(WHITE, 0.22);
+        unsafe {
+            self.g
+                .ctx
+                .DrawEllipse(&e, &self.g.brush, 2.0, &self.g.round)
+        };
+        let progress = progress.clamp(0.0, 1.0);
+        if progress >= 0.999 {
+            self.color(rgb, 1.0);
+            unsafe {
+                self.g
+                    .ctx
+                    .DrawEllipse(&e, &self.g.brush, 2.0, &self.g.round)
+            };
+        } else if progress > 0.001 {
+            let start = polar(cx, cy, r, -90.0);
+            let end = polar(cx, cy, r, -90.0 + 360.0 * progress);
+            let size = if progress > 0.5 {
+                D2D1_ARC_SIZE_LARGE
+            } else {
+                D2D1_ARC_SIZE_SMALL
+            };
+            let geo = self.geometry(|s| unsafe {
+                s.BeginFigure(v2(start.0, start.1), D2D1_FIGURE_BEGIN_HOLLOW);
+                arc_to(s, end.0, end.1, r, D2D1_SWEEP_DIRECTION_CLOCKWISE, size);
+                s.EndFigure(D2D1_FIGURE_END_OPEN);
+            });
+            self.stroke(geo, 2.0, rgb, 1.0);
+        }
     }
 
     fn battery(&self, r: Rect, p: Power) {
@@ -917,7 +1354,7 @@ impl Painter<'_> {
         );
         self.rrect(inner, 1.8, color, 1.0);
         if p.charging {
-            // Lightning bolt with a black outline so it reads over the green fill.
+            // Lightning bolt over the fill.
             let (bx, by, bw, bh) = (r.cx() - 4.0, r.y - 1.0, 8.0, r.h + 2.0);
             let pts: Vec<(f32, f32)> = [
                 (0.6, 0.0),

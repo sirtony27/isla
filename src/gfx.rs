@@ -10,10 +10,11 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap1, ID2D1BitmapBrush1, ID2D1DeviceContext, ID2D1Factory1,
-    ID2D1Image, ID2D1SolidColorBrush, D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-    D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
-    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1CreateFactory, ID2D1Bitmap1, ID2D1BitmapBrush1, ID2D1DeviceContext, ID2D1Factory,
+    ID2D1Factory1, ID2D1Image, ID2D1SolidColorBrush, ID2D1StrokeStyle, D2D1_BITMAP_OPTIONS,
+    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
+    D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_ROUND, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_LINE_JOIN_ROUND, D2D1_STROKE_STYLE_PROPERTIES,
     D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::Direct3D::{
@@ -105,6 +106,8 @@ pub struct Gfx {
     pub factory: ID2D1Factory1,
     pub ctx: ID2D1DeviceContext,
     pub brush: ID2D1SolidColorBrush,
+    /// Round caps and joins, for line icons.
+    pub round: ID2D1StrokeStyle,
     swap: IDXGISwapChain1,
     /// The swap chain's back buffer as a D2D target.
     target: Option<ID2D1Bitmap1>,
@@ -179,6 +182,19 @@ impl Gfx {
                 .CreateDevice(&dxgi)?
                 .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
             ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            // The base factory method: the D2D 1.1 overload returns ID2D1StrokeStyle1.
+            let base: &ID2D1Factory = &factory;
+            let round = base.CreateStrokeStyle(
+                &D2D1_STROKE_STYLE_PROPERTIES {
+                    startCap: D2D1_CAP_STYLE_ROUND,
+                    endCap: D2D1_CAP_STYLE_ROUND,
+                    dashCap: D2D1_CAP_STYLE_ROUND,
+                    lineJoin: D2D1_LINE_JOIN_ROUND,
+                    miterLimit: 1.0,
+                    ..Default::default()
+                },
+                None,
+            )?;
             let brush = ctx.CreateSolidColorBrush(
                 &D2D1_COLOR_F {
                     r: 1.0,
@@ -201,6 +217,7 @@ impl Gfx {
                 factory,
                 ctx,
                 brush,
+                round,
                 swap,
                 target: None,
                 dcomp,

@@ -2,9 +2,12 @@
 
 mod anim;
 mod app;
+mod audio;
+mod focus;
 mod gfx;
 mod i18n;
 mod media;
+mod privacy;
 mod settings;
 mod sys;
 mod tray;

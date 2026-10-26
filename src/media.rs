@@ -399,7 +399,12 @@ fn accent(bgra: &[u8]) -> u32 {
     }
     let n = n.max(1);
     let (mut r, mut g, mut b) = ((r / n) as f32, (g / n) as f32, (b / n) as f32);
-    let max = r.max(g).max(b).max(1.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    // Near-black or gray art has no hue to borrow: plain white reads best on black.
+    if max < 40.0 || max - min < 12.0 {
+        return 0xFFFFFF;
+    }
     // Normalize brightness to a fixed level, then mix a little white in.
     let k = 235.0 / max;
     r = (r * k) * 0.8 + 255.0 * 0.2;
