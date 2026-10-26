@@ -23,6 +23,7 @@ use windows_numerics::{Matrix3x2, Vector2};
 use crate::focus::{self, Focus, Phase};
 use crate::gfx::{Fonts, Gfx};
 use crate::i18n::Text;
+use crate::lyrics::Lyrics;
 use crate::media::{Info, ART_SIZE};
 use crate::sys::Power;
 
@@ -56,6 +57,10 @@ pub enum Hit {
     Volume,
     Drink,
     Focus,
+    /// The "Lyrics" button under the progress bar.
+    Lyrics,
+    /// A row of the lyrics view (0 = the line before the current one).
+    Line(u8),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +98,8 @@ pub struct Look {
     pub hidden: bool,
     /// Privacy dot color while the microphone or camera is in use.
     pub dot: Option<u32>,
+    /// The pill is wide enough to show the line being sung.
+    pub lyrics: bool,
 }
 
 /// Target (width, height, corner radius) of the notch for a mode.
@@ -101,9 +108,12 @@ pub fn size_for(mode: Mode, look: Look) -> (f32, f32, f32) {
         Mode::Closed if look.hidden && look.dot.is_none() => (160.0, 0.0, 0.0),
         Mode::Closed if look.hidden => (40.0, 22.0, 11.0),
         Mode::Closed => {
-            let w = 180.0
-                + if look.playing { 40.0 } else { 0.0 }
-                + if look.dot.is_some() { 18.0 } else { 0.0 };
+            let base = match (look.lyrics, look.playing) {
+                (true, _) => 360.0,
+                (false, true) => 220.0,
+                (false, false) => 180.0,
+            };
+            let w = base + if look.dot.is_some() { 18.0 } else { 0.0 };
             (w, 30.0, 12.0)
         }
         Mode::Open => (420.0, 212.0, 30.0),
@@ -114,6 +124,52 @@ pub fn size_for(mode: Mode, look: Look) -> (f32, f32, f32) {
         Mode::Activity(Act::Device) => (330.0, 40.0, 17.0),
         Mode::Activity(Act::Privacy) => (310.0, 36.0, 15.0),
     }
+}
+
+/// What the bottom half of the open panel shows.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum Panel {
+    #[default]
+    Cards,
+    Lyrics,
+}
+
+/// The loaded lyrics and where playback is in them.
+pub struct LyricsView<'a> {
+    pub lyrics: &'a Lyrics,
+    pub line: Option<usize>,
+    /// The line shown before `line`, which slides out while `t` goes from 0 to 1.
+    pub prev: Option<usize>,
+    pub t: f32,
+}
+
+/// Lyrics rows in the open panel: the previous line, the current one and two more.
+const ROWS: usize = 4;
+const ROW_H: f32 = 21.0;
+const CURRENT_ROW: isize = 1;
+
+fn rows_area() -> Rect {
+    let (w, _, _) = size_for(Mode::Open, Look::default());
+    Rect::new(CX - w / 2.0 + 18.0, 120.0, w - 36.0, 88.0)
+}
+
+fn row_rect(row: usize) -> Rect {
+    let a = rows_area();
+    Rect::new(a.x, a.y + 2.0 + row as f32 * ROW_H, a.w, ROW_H)
+}
+
+/// The line shown in a row (rows may also sit just outside 0..ROWS while sliding).
+fn row_line(v: &LyricsView, row: isize) -> Option<usize> {
+    let current = v.line.map_or(-1, |i| i as isize);
+    let index = current - CURRENT_ROW + row;
+    (0..v.lyrics.lines.len() as isize)
+        .contains(&index)
+        .then_some(index as usize)
+}
+
+/// The line under a clicked row, to seek to.
+pub fn line_at_row(v: &LyricsView, row: u8) -> Option<usize> {
+    row_line(v, row as isize)
 }
 
 pub fn phase_color(phase: Phase) -> u32 {
@@ -172,6 +228,7 @@ struct OpenLayout {
     water: Rect,
     focus: Rect,
     battery: Rect,
+    lyrics_button: Rect,
 }
 
 fn open_layout() -> OpenLayout {
@@ -210,6 +267,7 @@ fn open_layout() -> OpenLayout {
         water,
         focus,
         battery: Rect::new(focus.right() + 10.0, water.y, card_w, water.h),
+        lyrics_button: Rect::new(CX - 30.0, 99.0, 60.0, 18.0),
     }
 }
 
@@ -218,10 +276,21 @@ fn water_button() -> Rect {
     Rect::new(CX + w / 2.0 - 16.0 - 88.0, 17.0, 88.0, 30.0)
 }
 
-pub fn hit(mode: Mode, x: f32, y: f32, info: &Info, has_volume: bool) -> Hit {
+pub fn hit(
+    mode: Mode,
+    x: f32,
+    y: f32,
+    info: &Info,
+    has_volume: bool,
+    lyrics: Option<&LyricsView>,
+    panel: Panel,
+) -> Hit {
     match mode {
         Mode::Open => {
             let l = open_layout();
+            if lyrics.is_some() && l.lyrics_button.contains(x, y) {
+                return Hit::Lyrics;
+            }
             if info.active {
                 if l.prev.contains(x, y) && info.can_prev {
                     return Hit::Prev;
@@ -237,6 +306,13 @@ pub fn hit(mode: Mode, x: f32, y: f32, info: &Info, has_volume: bool) -> Hit {
                 {
                     return Hit::Seek;
                 }
+            }
+            if let (Some(lyrics), Panel::Lyrics) = (lyrics, panel) {
+                return (0..ROWS)
+                    .find(|&row| {
+                        row_rect(row).contains(x, y) && row_line(lyrics, row as isize).is_some()
+                    })
+                    .map_or(Hit::None, |row| Hit::Line(row as u8));
             }
             if has_volume {
                 if l.mute.contains(x, y) {
@@ -299,6 +375,8 @@ pub struct View<'a> {
     pub focus: Focus,
     pub focus_min: u32,
     pub focus_note: &'a str,
+    pub lyrics: Option<LyricsView<'a>>,
+    pub panel: Panel,
     pub hot: Hit,
     pub text: &'a Text,
     pub fonts: &'a Fonts,
@@ -439,7 +517,7 @@ pub fn compose(g: &Gfx, v: &View, layers: &Layers, dpi: f32) {
         }
         let p = Painter { g, alpha };
         match kind {
-            CLOSED => {}
+            CLOSED => draw_closed_live(&p, v),
             OPEN => draw_open_live(&p, v),
             _ => draw_activity_live(&p, v),
         }
@@ -522,6 +600,21 @@ fn draw_closed(p: &Painter, v: &View) {
         p.art(v, Rect::new(x0 + 10.0, 6.0, 18.0, 18.0), 5.0);
         p.bars(Rect::new(right - 14.0, 9.0, 14.0, 12.0), v.info.accent);
     }
+    if v.look.lyrics {
+        // The line itself is drawn live; only a running pomodoro shares the pill.
+        if let (Some(phase), Some(left)) = (v.focus.phase(), v.focus.remaining()) {
+            let r = Rect::new(right - 14.0 - 8.0 - FOCUS_W, 0.0, FOCUS_W, h);
+            p.text(
+                &focus::minutes(left),
+                &v.fonts.clock,
+                r,
+                DWRITE_TEXT_ALIGNMENT_TRAILING,
+                phase_color(phase),
+                1.0,
+            );
+        }
+        return;
+    }
     let center = Rect::new(CX - 50.0, 0.0, 100.0, h);
     match (v.focus.phase(), v.focus.remaining()) {
         (Some(phase), Some(left)) => {
@@ -544,6 +637,61 @@ fn draw_closed(p: &Painter, v: &View) {
             1.0,
         ),
     }
+}
+
+/// Room for "25 min" next to the bars when the pill shows lyrics.
+const FOCUS_W: f32 = 44.0;
+
+/// Where the current line goes in the pill: between the art and the bars.
+fn closed_lyrics_area(v: &View) -> Rect {
+    let (w, h, _) = size_for(Mode::Closed, v.look);
+    let (x0, x1) = (CX - w / 2.0, CX + w / 2.0);
+    let mut right = x1 - 10.0 - 14.0 - 10.0;
+    if v.look.dot.is_some() {
+        right -= 16.0;
+    }
+    if v.focus.phase().is_some() {
+        right -= FOCUS_W + 6.0;
+    }
+    Rect::new(x0 + 38.0, 0.0, right - (x0 + 38.0), h)
+}
+
+/// The line being sung, sliding up over the previous one when it changes.
+fn draw_closed_live(p: &Painter, v: &View) {
+    let Some(l) = v
+        .lyrics
+        .as_ref()
+        .filter(|_| v.look.lyrics && !v.look.hidden)
+    else {
+        return;
+    };
+    let area = closed_lyrics_area(v);
+    let shift = 9.0;
+    if l.t < 1.0 {
+        let r = Rect::new(area.x, area.y - shift * l.t, area.w, area.h);
+        lyric_text(p, v, l.lyrics.text(l.prev), r, true, 1.0 - l.t);
+    }
+    let r = Rect::new(area.x, area.y + shift * (1.0 - l.t), area.w, area.h);
+    lyric_text(p, v, l.lyrics.text(l.line), r, true, l.t);
+}
+
+/// One lyric line, centered. Long lines get a smaller font before being cut;
+/// instrumental breaks and intros show a note.
+fn lyric_text(p: &Painter, v: &View, text: Option<&str>, r: Rect, strong: bool, a: f32) {
+    if a <= 0.01 {
+        return;
+    }
+    let f = v.fonts;
+    let (text, a) = match text {
+        Some(t) if !t.is_empty() => (t, a),
+        _ => ("\u{266A}", a * 0.5),
+    };
+    let font = match strong {
+        true if f.width(text, &f.label) > r.w => &f.label_small,
+        true => &f.label,
+        false => &f.body,
+    };
+    p.text(text, font, r, DWRITE_TEXT_ALIGNMENT_CENTER, WHITE, a);
 }
 
 fn draw_open(p: &Painter, v: &View) {
@@ -589,6 +737,29 @@ fn draw_open(p: &Painter, v: &View) {
             _ if info.playing => p.pause(rect.cx(), rect.cy(), 17.0, a),
             _ => p.play(rect.cx() + 1.5, rect.cy(), 17.0, WHITE, a),
         }
+    }
+
+    if v.lyrics.is_some() {
+        let b = l.lyrics_button;
+        let active = v.panel == Panel::Lyrics;
+        let bg = match (active, v.hot == Hit::Lyrics) {
+            (true, _) => 0.22,
+            (false, true) => 0.15,
+            (false, false) => 0.08,
+        };
+        p.rrect(b, b.h / 2.0, WHITE, bg);
+        let a = if active { 1.0 } else { 0.7 };
+        p.text(
+            v.text.lyrics_button,
+            &f.small,
+            b,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            WHITE,
+            a,
+        );
+    }
+    if v.panel == Panel::Lyrics {
+        return;
     }
 
     // Water card: the whole card adds a glass.
@@ -707,6 +878,10 @@ fn tx_of(card: Rect) -> f32 {
 fn draw_open_live(p: &Painter, v: &View) {
     let l = open_layout();
     draw_progress(p, v, &l);
+    if v.panel == Panel::Lyrics {
+        draw_lyric_rows(p, v);
+        return;
+    }
     if let Some((level, muted)) = v.volume {
         if v.hot == Hit::Mute {
             p.circle(l.mute.cx(), l.mute.cy(), 11.0, WHITE, 0.12);
@@ -746,6 +921,43 @@ fn draw_open_live(p: &Painter, v: &View) {
             1.0,
         );
     }
+}
+
+/// Previous, current and next lines; they scroll up one row when the line changes.
+fn draw_lyric_rows(p: &Painter, v: &View) {
+    let Some(l) = &v.lyrics else { return };
+    let area = rows_area();
+    let shift = ROW_H * (1.0 - l.t);
+    unsafe {
+        p.g.ctx
+            .PushAxisAlignedClip(&area.d2d(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE)
+    };
+    // One extra row above, for the line scrolling out.
+    for row in -1..ROWS as isize {
+        let r = Rect::new(
+            area.x,
+            area.y + 2.0 + row as f32 * ROW_H + shift,
+            area.w,
+            ROW_H,
+        );
+        let current = row == CURRENT_ROW;
+        let a = match row - CURRENT_ROW {
+            0 => 0.45 + 0.55 * l.t,
+            -1 | 1 => 0.45,
+            _ => 0.25,
+        };
+        let line = row_line(l, row);
+        if line.is_some() && row >= 0 && v.hot == Hit::Line(row as u8) {
+            p.rrect(Rect::new(r.x, r.y + 1.0, r.w, r.h - 2.0), 8.0, WHITE, 0.08);
+        }
+        match line {
+            Some(i) => lyric_text(p, v, Some(&l.lyrics.lines[i].text), r, current, a),
+            // Before the first line: a note where the current line will be.
+            None if current => lyric_text(p, v, None, r, true, a),
+            None => {}
+        }
+    }
+    unsafe { p.g.ctx.PopAxisAlignedClip() };
 }
 
 fn draw_progress(p: &Painter, v: &View, l: &OpenLayout) {

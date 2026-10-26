@@ -39,8 +39,11 @@ Read [AGENTS.md](AGENTS.md). In short:
 - No polling and no new timers without a reason; react to Windows events.
 - Draw only when something changed; cache what does not change.
 - No new dependencies beyond the official `windows-rs` crates without discussion.
-- No keyboard/mouse hooks, no network access.
+- No keyboard/mouse hooks. No network access, except the opt-in lyrics (decision 0004).
 - UI strings go in `src/i18n.rs`, in every language.
+
+Parsers have unit tests: `cargo test --release`. Add `-- --include-ignored` to also run
+the test that talks to lrclib.net.
 
 When a change affects resource use, include before/after numbers in the PR: private
 memory and CPU over 10 s idle (Task Manager or `Get-Process isla`).
@@ -62,3 +65,6 @@ memory and CPU over 10 s idle (Task Manager or `Get-Process isla`).
 | `src/tray.rs` | Tray icon and menu |
 | `src/settings.rs` | `settings.ini` load and save |
 | `src/i18n.rs` | Translations |
+| `src/lyrics.rs` | Synced lyrics: LRCLIB lookup on its own thread, LRC parsing |
+| `src/net.rs` | HTTPS GET through WinHTTP, loaded only when lyrics are on |
+| `src/json.rs` | Minimal JSON parser for LRCLIB's answers |

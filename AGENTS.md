@@ -8,7 +8,8 @@ Aplican a cualquier agente que escriba código en este repo.
   timers que consulten estado. Se usan eventos del sistema (SMTC, `WM_POWERBROADCAST`, appbar).
 - Se dibuja solo si algo cambió (`dirty`) o durante una animación. Al asentarse, se deja de dibujar.
 - Timers permitidos: los listados en `src/app.rs` (`TIMER_*`). Uno nuevo requiere justificar su frecuencia.
-- Sin hooks globales de teclado o mouse (`SetWindowsHookEx`). Sin red.
+- Sin hooks globales de teclado o mouse (`SetWindowsHookEx`). Sin red, salvo las letras
+  sincronizadas: opcionales, apagadas por defecto y limitadas a LRCLIB (decisión 0004).
 
 ## Presupuesto (no se supera)
 

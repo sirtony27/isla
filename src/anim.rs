@@ -62,3 +62,8 @@ pub const fn size(value: f32) -> Spring {
 pub const fn fade(value: f32) -> Spring {
     Spring::new(value, 26.0, 1.0, 0.002)
 }
+
+/// Spring for a lyric line sliding in: quicker than a fade, so a line change costs few frames.
+pub const fn slide(value: f32) -> Spring {
+    Spring::new(value, 45.0, 1.0, 0.01)
+}

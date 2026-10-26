@@ -77,6 +77,8 @@ impl Tray {
 
 pub const FOCUS_LENGTHS: [u32; 4] = [15, 25, 45, 50];
 pub const REST_LENGTHS: [u32; 3] = [5, 10, 15];
+/// Lyrics offsets in milliseconds, from "earlier" to "later".
+pub const LYRICS_OFFSETS: [i32; 7] = [1000, 500, 250, 0, -250, -500, -1000];
 
 #[derive(Clone, Copy)]
 pub enum Alert {
@@ -103,6 +105,8 @@ pub struct MenuState {
     pub focus_running: bool,
     pub focus_min: u32,
     pub rest_min: u32,
+    pub lyrics: bool,
+    pub lyrics_offset: i32,
     pub text: Text,
 }
 
@@ -122,6 +126,8 @@ pub enum MenuCmd {
     FocusToggle,
     FocusLength(u32),
     RestLength(u32),
+    Lyrics,
+    LyricsOffset(i32),
     Exit,
 }
 
@@ -140,6 +146,7 @@ const ID_HOTKEY: usize = 3;
 const ID_WATER: usize = 4;
 const ID_RESET: usize = 5;
 const ID_FOCUS: usize = 6;
+const ID_LYRICS: usize = 7;
 const ID_EXIT: usize = 9;
 const ID_MONITOR_PRIMARY: usize = 10;
 const ID_MONITOR_ACTIVE: usize = 11;
@@ -149,6 +156,7 @@ const ID_GOAL: usize = 200;
 const ID_GLASS: usize = 300;
 const ID_FOCUS_LEN: usize = 400;
 const ID_REST_LEN: usize = 500;
+const ID_LYRICS_OFFSET: usize = 600;
 
 fn item(menu: HMENU, id: usize, label: &str, checked: bool) {
     let flags = if checked {
@@ -239,6 +247,21 @@ pub fn show_menu(hwnd: HWND, s: &MenuState) -> MenuCmd {
         submenu(menu, t.menu_alerts, &alerts);
         separator(menu);
 
+        item(menu, ID_LYRICS, t.menu_lyrics, s.lyrics);
+        let offsets: Vec<_> = LYRICS_OFFSETS
+            .iter()
+            .enumerate()
+            .map(|(i, &ms)| {
+                (
+                    ID_LYRICS_OFFSET + i,
+                    t.lyrics_offset(ms),
+                    ms == s.lyrics_offset,
+                )
+            })
+            .collect();
+        submenu(menu, t.menu_lyrics_timing, &offsets);
+        separator(menu);
+
         item(menu, ID_WATER, t.menu_water, s.water_enabled);
         submenu(
             menu,
@@ -294,11 +317,15 @@ pub fn show_menu(hwnd: HWND, s: &MenuState) -> MenuCmd {
             ID_WATER => MenuCmd::WaterToggle,
             ID_RESET => MenuCmd::ResetWater,
             ID_FOCUS => MenuCmd::FocusToggle,
+            ID_LYRICS => MenuCmd::Lyrics,
             ID_EXIT => MenuCmd::Exit,
             ID_MONITOR_PRIMARY => MenuCmd::Monitor(false),
             ID_MONITOR_ACTIVE => MenuCmd::Monitor(true),
             i if (ID_ALERT..ID_ALERT + ALERTS.len()).contains(&i) => {
                 MenuCmd::Alert(ALERTS[i - ID_ALERT])
+            }
+            i if (ID_LYRICS_OFFSET..ID_LYRICS_OFFSET + LYRICS_OFFSETS.len()).contains(&i) => {
+                MenuCmd::LyricsOffset(LYRICS_OFFSETS[i - ID_LYRICS_OFFSET])
             }
             i => pick(i, ID_INTERVAL, &INTERVALS)
                 .map(MenuCmd::Interval)

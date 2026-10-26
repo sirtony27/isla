@@ -8,6 +8,9 @@ the things your PC wants to tell you, then gets out of the way.
 - **Now playing, from any player.** Spotify, YouTube in any browser, Apple Music, and
   anything else that shows up in the Windows media flyout. Album art, title, artist,
   a live progress bar you can click to seek, and previous / play-pause / next.
+- **Synced lyrics (optional).** The line being sung, right in the pill, from the free
+  [LRCLIB](https://lrclib.net) database. Open the panel for the lines around it and click
+  one to jump there. Off by default: it is the only feature that uses the internet.
 - **Volume.** A slider in the panel (click the speaker to mute), the mouse wheel over
   the notch, and a clean overlay whenever the volume changes.
 - **System alerts.** Brightness (laptop screens), audio output switched ("AirPods
@@ -26,11 +29,11 @@ the things your PC wants to tell you, then gets out of the way.
 
 ## Light by design
 
-| | Isla 0.2, everything on |
+| | Isla 0.3, everything on |
 |---|---|
-| Download | one `.exe`, about 0.45 MB, no installer |
-| Memory | about 13 MB private (37 MB working set) |
-| CPU when idle | 0 %, also with music playing |
+| Download | one `.exe`, about 0.5 MB, no installer |
+| Memory | about 10 MB private; about 14 MB with lyrics on |
+| CPU when idle | 0 %, also with music playing (lyrics: a short slide per line) |
 | Dependencies | none at runtime; Windows 10 1809+ or Windows 11, 64-bit |
 
 How it stays that light:
@@ -43,8 +46,8 @@ How it stays that light:
   just composes those bitmaps, and drawing stops the moment it settles.
 - **No GPU driver in the process.** Isla rasterizes its small surface with WARP and lets
   Windows compose it on the GPU, so a laptop's discrete GPU is never woken up.
-- **No keyboard or mouse hooks, no network, no telemetry.** The Win+Alt+N shortcut is a
-  registered hotkey: Windows reports only that combination.
+- **No keyboard or mouse hooks, no telemetry, and no network unless you turn lyrics on.**
+  The Win+Alt+N shortcut is a registered hotkey: Windows reports only that combination.
 
 ## Install
 
@@ -57,16 +60,21 @@ How it stays that light:
    new and not code-signed: click **More info → Run anyway**. The build is reproducible
    from this repository by GitHub Actions, so you can verify exactly what you run.
 
-Right-click the tray icon for settings: start with Windows, water reminder interval,
-daily goal, glass size, or exit. Settings live in `%APPDATA%\Isla\settings.ini`.
+Right-click the tray icon for settings: start with Windows, alerts, synced lyrics and
+their timing, water reminder interval, daily goal, glass size, focus timer, or exit. Settings live in `%APPDATA%\Isla\settings.ini`.
 
 To uninstall: uncheck "Start with Windows" if you enabled it, exit from the tray, then
 delete the exe and `%APPDATA%\Isla`.
 
 ## Privacy
 
-Isla makes no network connections. It reads the media session Windows already exposes
-(title, artist, artwork) and the power status. Your water log stays in your user folder.
+Isla reads the media session Windows already exposes (title, artist, artwork) and the
+power status. Your water log stays in your user folder.
+
+Out of the box Isla makes no network connections. If you turn on **synced lyrics**, it
+sends the title, artist, album and length of each new song to [lrclib.net](https://lrclib.net)
+to fetch its lyrics, and nothing else: no identifiers, no cookies. Lyrics are kept in
+memory only. With lyrics off, Isla does not even load Windows' networking libraries.
 
 ## Build from source
 
@@ -78,8 +86,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the toolchain setup and project rules
 
 ## Roadmap
 
-Ideas for after 0.1: synced lyrics, focus timer, volume and brightness overlays,
-multi-monitor placement, a minimal "line" mode for laptops with thick bezels.
+Ideas: a minimal "line" mode for laptops with thick bezels.
 
 ## License
 

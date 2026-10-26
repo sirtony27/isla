@@ -28,14 +28,15 @@ use crate::audio::{self, Audio};
 use crate::focus::{Focus, Phase};
 use crate::gfx::{Fonts, Gfx};
 use crate::i18n::{self, Text};
+use crate::lyrics::{self, Fetcher, Lyrics};
 use crate::media::{self, Info, Media, ART_SIZE};
 use crate::privacy::{self, InUse};
 use crate::settings::Settings;
 use crate::sys::{self, Power};
 use crate::tray::{Alert, MenuCmd, MenuState, Tray};
 use crate::ui::{
-    self, Act, Hit, Layers, Look, Mode, PowerEvent, View, CAM_COLOR, CX, FLARE, HOT_STRIP,
-    MIC_COLOR, WIN_H, WIN_W,
+    self, Act, Hit, Layers, Look, LyricsView, Mode, Panel, PowerEvent, View, CAM_COLOR, CX, FLARE,
+    HOT_STRIP, MIC_COLOR, WIN_H, WIN_W,
 };
 
 pub const WM_APP_TRAY: u32 = WM_APP + 1;
@@ -44,6 +45,7 @@ pub const WM_APP_APPBAR: u32 = WM_APP + 3;
 pub const WM_APP_AUDIO: u32 = WM_APP + 4;
 pub const WM_APP_PRIVACY: u32 = WM_APP + 5;
 pub const WM_APP_FOREGROUND: u32 = WM_APP + 6;
+pub const WM_APP_LYRICS: u32 = WM_APP + 7;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const NIN_SELECT: u32 = WM_USER;
 const NIN_KEYSELECT: u32 = WM_USER + 1;
@@ -61,11 +63,17 @@ const TIMER_CLOCK: usize = 4; // once a minute, on the minute
 const TIMER_LIVE: usize = 5; // 1 Hz, only while open and something is counting
 const TIMER_WATER: usize = 6; // every N minutes, only if the reminder is on
 const TIMER_FOCUS: usize = 7; // when the pomodoro's shown minute changes or it ends
+const TIMER_LYRIC: usize = 8; // one-shot: when the next lyric line starts, only while one is on screen
+const TIMER_LYRICS_FETCH: usize = 9; // 0.7 s after a track change, up to 4 times if the duration is late
 
 const HOVER_DELAY: u32 = 110;
 const LEAVE_DELAY: u32 = 280;
 const LEVEL_DURATION: u32 = 1500;
 const VOLUME_STEP: f32 = 0.02;
+/// Players send the new title before the new duration; LRCLIB matches on both.
+const LYRICS_FETCH_DELAY: u32 = 700;
+/// Lines change this much before their timestamp, so the slide settles as the line is sung.
+const LYRIC_LEAD: f64 = 0.1;
 
 pub fn create_window(proc: WNDPROC) -> Result<HWND> {
     unsafe {
@@ -143,6 +151,21 @@ pub struct App {
     focus: Focus,
     focus_note: String,
 
+    lyrics_fetcher: Option<Fetcher>,
+    lyrics: Option<Arc<Lyrics>>,
+    /// Bumped on every track change; answers for an older track are dropped.
+    lyrics_gen: u64,
+    /// The previous track had lyrics and the next one's are on the way: keep the pill wide.
+    lyrics_waiting: bool,
+    /// The player sent its timeline after the last track change, so the duration is current.
+    timeline_fresh: bool,
+    /// Times the request was put off waiting for that timeline.
+    lyrics_delays: u8,
+    lyric_line: Option<usize>,
+    lyric_prev: Option<usize>,
+    /// 0 → 1 while a new line slides in.
+    lyric_t: Spring,
+
     clock: String,
     date: String,
     power: Power,
@@ -205,6 +228,15 @@ impl App {
             privacy_shown: (false, String::new()),
             focus: Focus::default(),
             focus_note: String::new(),
+            lyrics_fetcher: settings.lyrics.then(|| Fetcher::start(hwnd, WM_APP_LYRICS)),
+            lyrics: None,
+            lyrics_gen: 0,
+            lyrics_waiting: false,
+            timeline_fresh: false,
+            lyrics_delays: 0,
+            lyric_line: None,
+            lyric_prev: None,
+            lyric_t: anim::slide(1.0),
             clock: sys::clock_text(),
             date: sys::date_text(),
             power,
@@ -406,6 +438,37 @@ impl App {
             playing: self.playing(),
             hidden: self.settings.hidden,
             dot,
+            lyrics: self.playing() && (self.has_lyrics() || self.lyrics_waiting),
+        }
+    }
+
+    /// Lyrics are loaded for this track and the player reports where it is.
+    fn has_lyrics(&self) -> bool {
+        self.lyrics.is_some() && self.info.duration > 0.0
+    }
+
+    fn panel(&self) -> Panel {
+        if self.settings.lyrics_view && self.has_lyrics() {
+            Panel::Lyrics
+        } else {
+            Panel::Cards
+        }
+    }
+
+    fn lyrics_view(&self) -> Option<LyricsView<'_>> {
+        let lyrics = self.lyrics.as_deref().filter(|_| self.has_lyrics())?;
+        Some(LyricsView {
+            lyrics,
+            line: self.lyric_line,
+            prev: self.lyric_prev,
+            t: self.lyric_t.value,
+        })
+    }
+
+    fn animate(&mut self) {
+        if !self.animating {
+            self.animating = true;
+            self.last_frame = Instant::now();
         }
     }
 
@@ -422,10 +485,7 @@ impl App {
         self.a_open.set(on(self.mode == Mode::Open));
         self.a_act.set(on(matches!(self.mode, Mode::Activity(_))));
         self.grow_region();
-        if !self.animating {
-            self.animating = true;
-            self.last_frame = Instant::now();
-        }
+        self.animate();
     }
 
     fn set_mode(&mut self, mode: Mode) {
@@ -448,6 +508,7 @@ impl App {
         self.mode = mode;
         self.retarget();
         self.update_live_timer();
+        self.sync_lyrics();
     }
 
     fn show_activity(&mut self, act: Act, ms: u32) {
@@ -503,9 +564,10 @@ impl App {
         }
         self.changed();
         self.update_live_timer();
+        self.sync_lyrics();
     }
 
-    fn springs(&mut self) -> [&mut Spring; 6] {
+    fn springs(&mut self) -> [&mut Spring; 7] {
         [
             &mut self.w,
             &mut self.h,
@@ -513,6 +575,7 @@ impl App {
             &mut self.a_closed,
             &mut self.a_open,
             &mut self.a_act,
+            &mut self.lyric_t,
         ]
     }
 
@@ -553,6 +616,8 @@ impl App {
         }
         self.dirty = false;
         let Some(gfx) = &self.gfx else { return };
+        // Taken out for the draw, so the view can borrow the rest of the app.
+        let mut layers = std::mem::take(&mut self.layers);
         let view = View {
             w: self.w.value,
             h: self.h.value,
@@ -582,13 +647,16 @@ impl App {
             focus: self.focus,
             focus_min: self.settings.focus_min,
             focus_note: &self.focus_note,
+            lyrics: self.lyrics_view(),
+            panel: self.panel(),
             hot: self.hot,
             text: &self.text,
             fonts: &self.fonts,
         };
         let dpi = self.dpi as f32;
-        let drawn = ui::prepare(gfx, &view, &mut self.layers, dpi)
-            .and_then(|_| gfx.draw(|g| ui::compose(g, &view, &self.layers, dpi)));
+        let drawn = ui::prepare(gfx, &view, &mut layers, dpi)
+            .and_then(|_| gfx.draw(|g| ui::compose(g, &view, &layers, dpi)));
+        self.layers = layers;
         if drawn.is_err() {
             // Device lost (driver update, GPU reset): rebuild it from scratch.
             self.gfx = None;
@@ -607,7 +675,15 @@ impl App {
     }
 
     fn hit_at(&self, x: f32, y: f32) -> Hit {
-        ui::hit(self.mode, x, y, &self.info, self.has_volume())
+        ui::hit(
+            self.mode,
+            x,
+            y,
+            &self.info,
+            self.has_volume(),
+            self.lyrics_view().as_ref(),
+            self.panel(),
+        )
     }
 
     fn point(&self, lp: LPARAM) -> (f32, f32) {
@@ -703,13 +779,24 @@ impl App {
                 self.info.playing = !self.info.playing;
                 self.update_live_timer();
                 self.changed();
+                self.sync_lyrics();
             }
-            Hit::Seek => {
-                let seconds = ui::seek_fraction(x) * self.info.duration;
-                self.media.seek(seconds);
-                self.info.position = seconds;
-                self.info.sampled = Some(Instant::now());
-                self.dirty = true;
+            Hit::Seek => self.seek_to(ui::seek_fraction(x) * self.info.duration),
+            Hit::Lyrics => {
+                self.settings.lyrics_view = !self.settings.lyrics_view;
+                self.settings.save();
+                self.changed();
+                self.sync_lyrics();
+            }
+            Hit::Line(row) => {
+                let start = self
+                    .lyrics_view()
+                    .and_then(|v| ui::line_at_row(&v, row).map(|i| v.lyrics.lines[i].time));
+                if let Some(start) = start {
+                    // Land just inside the line, so it is the one highlighted.
+                    let seconds = start - self.lyric_offset() + 0.05;
+                    self.seek_to(seconds.clamp(0.0, self.info.duration));
+                }
             }
             Hit::Mute => {
                 if let Some(audio) = &mut self.audio {
@@ -726,6 +813,14 @@ impl App {
             }
             Hit::Focus => self.toggle_focus(),
         }
+    }
+
+    fn seek_to(&mut self, seconds: f64) {
+        self.media.seek(seconds);
+        self.info.position = seconds;
+        self.info.sampled = Some(Instant::now());
+        self.dirty = true;
+        self.sync_lyrics();
     }
 
     fn on_wheel(&mut self, steps: f32) {
@@ -787,6 +882,17 @@ impl App {
             TIMER_LIVE => self.dirty = true,
             TIMER_WATER => self.on_water_timer(),
             TIMER_FOCUS => self.on_focus_timer(),
+            TIMER_LYRIC => self.sync_lyrics(),
+            TIMER_LYRICS_FETCH => {
+                // Without the new duration LRCLIB could return another cut of the song,
+                // so give a slow player a little more time before asking without it.
+                if !self.timeline_fresh && self.lyrics_delays < 3 {
+                    self.lyrics_delays += 1;
+                } else {
+                    self.kill_timer(TIMER_LYRICS_FETCH);
+                    self.fetch_lyrics();
+                }
+            }
             _ => {}
         }
     }
@@ -800,17 +906,23 @@ impl App {
             (shared.info.clone(), art)
         };
         let track_changed = info.title != self.info.title || info.artist != self.info.artist;
-        let was_playing = self.playing();
+        let was = self.look();
         if let Some(art) = art {
             self.art_pixels = art;
             self.rebuild_art();
         }
         self.info = info;
+        if track_changed {
+            self.reset_lyrics();
+        }
+        if changed & media::CHANGED_TIMELINE != 0 {
+            self.timeline_fresh = true;
+        }
         let playing = self.playing();
         let announce = self.media_ready && self.settings.notify_track && track_changed && playing;
         if announce && !self.info.title.is_empty() && self.mode == Mode::Closed {
             self.show_activity(Act::Track, 3000);
-        } else if playing != was_playing && self.mode == Mode::Closed {
+        } else if self.look() != was && self.mode == Mode::Closed {
             self.retarget();
         }
         self.media_ready = true;
@@ -820,6 +932,120 @@ impl App {
             self.changed();
         } else if self.mode == Mode::Open {
             self.dirty = true;
+        }
+        // Every timeline update re-anchors the next line to the player's real position.
+        self.sync_lyrics();
+    }
+
+    // ---- lyrics ----
+
+    /// Seconds added to the playback position to pick the line: the user's
+    /// adjustment plus the lead that lets the slide finish on time.
+    fn lyric_offset(&self) -> f64 {
+        self.settings.lyrics_offset as f64 / 1000.0 + LYRIC_LEAD
+    }
+
+    fn lyrics_shown(&self) -> bool {
+        self.visible
+            && match self.mode {
+                Mode::Closed => self.look().lyrics && !self.settings.hidden,
+                Mode::Open => self.panel() == Panel::Lyrics,
+                Mode::Activity(_) => false,
+            }
+    }
+
+    /// A new track: drop the old lyrics and ask for the new ones once the player settles.
+    fn reset_lyrics(&mut self) {
+        self.lyrics_waiting |= self.lyrics.is_some();
+        self.lyrics = None;
+        self.lyric_line = None;
+        self.lyric_prev = None;
+        self.lyrics_gen += 1;
+        self.timeline_fresh = false;
+        self.lyrics_delays = 0;
+        self.kill_timer(TIMER_LYRIC);
+        if self.lyrics_fetcher.is_some() && self.info.active && !self.info.title.is_empty() {
+            self.set_timer(TIMER_LYRICS_FETCH, LYRICS_FETCH_DELAY);
+        } else {
+            self.lyrics_waiting = false;
+            self.kill_timer(TIMER_LYRICS_FETCH);
+        }
+    }
+
+    fn fetch_lyrics(&mut self) {
+        let Some(fetcher) = &self.lyrics_fetcher else {
+            return;
+        };
+        if !self.info.active || self.info.title.is_empty() {
+            self.lyrics_waiting = false;
+            return;
+        }
+        let i = &self.info;
+        fetcher.request(
+            self.lyrics_gen,
+            lyrics::Query {
+                title: i.title.clone(),
+                artist: i.artist.clone(),
+                album: i.album.clone(),
+                // A duration left over from the previous track would rule out the right lyrics.
+                duration: if self.timeline_fresh { i.duration } else { 0.0 },
+            },
+        );
+    }
+
+    fn on_lyrics(&mut self) {
+        let answer = self
+            .lyrics_fetcher
+            .as_ref()
+            .and_then(|f| f.answer.lock().ok().and_then(|mut a| a.take()));
+        let Some((generation, lyrics)) = answer else {
+            return;
+        };
+        if generation != self.lyrics_gen {
+            return;
+        }
+        let was = self.look();
+        self.lyrics = lyrics;
+        self.lyrics_waiting = false;
+        self.lyric_prev = None;
+        self.lyric_line = self
+            .lyrics
+            .as_ref()
+            .and_then(|l| l.index_at(self.info.position_now() + self.lyric_offset()));
+        self.lyric_t = anim::slide(1.0);
+        if self.look() != was && self.mode == Mode::Closed {
+            self.retarget();
+        }
+        self.changed();
+        self.sync_lyrics();
+    }
+
+    /// Shows the line being sung now and sets a timer for when the next one starts.
+    fn sync_lyrics(&mut self) {
+        self.kill_timer(TIMER_LYRIC);
+        let Some(lyrics) = self.lyrics.clone().filter(|_| self.has_lyrics()) else {
+            return;
+        };
+        let clock = self.info.position_now() + self.lyric_offset();
+        let line = lyrics.index_at(clock);
+        let shown = self.lyrics_shown();
+        if line != self.lyric_line {
+            self.lyric_prev = self.lyric_line;
+            self.lyric_line = line;
+            if shown {
+                self.lyric_t.value = 0.0;
+                self.animate();
+            }
+            self.dirty = true;
+        }
+        if !(shown && self.playing()) {
+            return;
+        }
+        let next = line.map_or(0, |i| i + 1);
+        if let Some(start) = lyrics.lines.get(next).map(|l| l.time) {
+            // A timer that fires a few milliseconds early just re-arms for the rest.
+            let ms = ((start - clock) * 1000.0).ceil().max(0.0) as u32;
+            self.set_timer(TIMER_LYRIC, ms.max(USER_TIMER_MINIMUM));
         }
     }
 
@@ -1049,6 +1275,8 @@ impl App {
             focus_running: self.focus.phase().is_some(),
             focus_min: s.focus_min,
             rest_min: s.break_min,
+            lyrics: s.lyrics,
+            lyrics_offset: s.lyrics_offset,
             text: self.text,
         }
     }
@@ -1093,6 +1321,8 @@ impl App {
             MenuCmd::ResetWater => s.water_ml = 0,
             MenuCmd::FocusLength(m) => s.focus_min = m,
             MenuCmd::RestLength(m) => s.break_min = m,
+            MenuCmd::Lyrics => s.lyrics = !s.lyrics,
+            MenuCmd::LyricsOffset(ms) => s.lyrics_offset = ms,
         }
         self.settings.save();
         self.apply_settings();
@@ -1115,9 +1345,27 @@ impl App {
             }
             _ => {}
         }
+        match (self.settings.lyrics, self.lyrics_fetcher.is_some()) {
+            (true, false) => {
+                self.lyrics_fetcher = Some(Fetcher::start(self.hwnd, WM_APP_LYRICS));
+                self.lyrics_gen += 1;
+                self.fetch_lyrics();
+            }
+            (false, true) => {
+                // Ends the worker thread; nothing else touches the network.
+                self.lyrics_fetcher = None;
+                self.lyrics = None;
+                self.lyrics_waiting = false;
+                self.lyric_line = None;
+                self.lyric_prev = None;
+                self.kill_timer(TIMER_LYRICS_FETCH);
+            }
+            _ => {}
+        }
         self.schedule_water();
         self.retarget();
         self.changed();
+        self.sync_lyrics();
     }
 
     // ---- dispatch ----
@@ -1160,6 +1408,7 @@ impl App {
             WM_APP_AUDIO => self.on_audio(wp.0, lp.0),
             WM_APP_PRIVACY => self.on_privacy(),
             WM_APP_FOREGROUND => self.on_foreground(),
+            WM_APP_LYRICS => self.on_lyrics(),
             WM_APP_TRAY => {
                 let event = lp.0 as u32 & 0xFFFF;
                 if event == NIN_SELECT || event == NIN_KEYSELECT {

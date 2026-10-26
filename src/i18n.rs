@@ -44,6 +44,12 @@ pub struct Text {
     pub menu_focus_stop: &'static str,
     pub menu_focus_len: &'static str,
     pub menu_rest_len: &'static str,
+    pub menu_lyrics: &'static str,
+    pub menu_lyrics_timing: &'static str,
+    pub lyrics_button: &'static str,
+    pub lyrics_exact: &'static str,
+    pub lyrics_earlier: &'static str,
+    pub lyrics_later: &'static str,
     pub menu_exit: &'static str,
     pub decimal_comma: bool,
 }
@@ -90,6 +96,12 @@ const EN: Text = Text {
     menu_focus_stop: "Stop focus timer",
     menu_focus_len: "Focus length",
     menu_rest_len: "Break length",
+    menu_lyrics: "Synced lyrics (from LRCLIB)",
+    menu_lyrics_timing: "Lyrics timing",
+    lyrics_button: "Lyrics",
+    lyrics_exact: "No adjustment",
+    lyrics_earlier: "earlier",
+    lyrics_later: "later",
     menu_exit: "Exit",
     decimal_comma: false,
 };
@@ -136,6 +148,12 @@ const ES: Text = Text {
     menu_focus_stop: "Detener Pomodoro",
     menu_focus_len: "Duración del enfoque",
     menu_rest_len: "Duración del descanso",
+    menu_lyrics: "Letras sincronizadas (de LRCLIB)",
+    menu_lyrics_timing: "Sincronía de las letras",
+    lyrics_button: "Letra",
+    lyrics_exact: "Sin ajuste",
+    lyrics_earlier: "antes",
+    lyrics_later: "después",
     menu_exit: "Salir",
     decimal_comma: true,
 };
@@ -170,5 +188,19 @@ impl Text {
             s.trim_end_matches('0').trim_end_matches('.').to_string()
         };
         self.decimal(format!("{} / {} L", short(ml), short(goal)))
+    }
+
+    /// "0.5 s earlier", "1 s later" or "No adjustment" for a lyrics offset.
+    pub fn lyrics_offset(&self, ms: i32) -> String {
+        if ms == 0 {
+            return self.lyrics_exact.to_string();
+        }
+        let side = if ms > 0 {
+            self.lyrics_earlier
+        } else {
+            self.lyrics_later
+        };
+        let seconds = self.decimal(format!("{}", ms.unsigned_abs() as f32 / 1000.0));
+        format!("{seconds} s {side}")
     }
 }

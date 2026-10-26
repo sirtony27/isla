@@ -43,6 +43,7 @@ pub struct Info {
     pub active: bool,
     pub title: String,
     pub artist: String,
+    pub album: String,
     pub playing: bool,
     pub can_prev: bool,
     pub can_next: bool,
@@ -257,6 +258,10 @@ impl Worker {
         let props = session.TryGetMediaPropertiesAsync()?.join()?;
         let title = props.Title()?.to_string();
         let artist = props.Artist()?.to_string();
+        let album = props
+            .AlbumTitle()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
         let key = format!(
             "{}|{title}|{artist}",
             session.SourceAppUserModelId().unwrap_or_default()
@@ -276,6 +281,7 @@ impl Worker {
         let changed = shared.info.title != title || shared.info.artist != artist || art.is_some();
         shared.info.title = title;
         shared.info.artist = artist;
+        shared.info.album = album;
         if let Some(art) = art {
             shared.info.accent = art.as_ref().map_or(0xFFFFFF, |px| accent(px));
             shared.art = art.map(Arc::new);

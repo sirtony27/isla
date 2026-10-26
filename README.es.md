@@ -8,6 +8,9 @@ que suena y lo que tu PC quiere contarte. Después se aparta.
 - **Lo que suena, de cualquier reproductor.** Spotify, YouTube en cualquier navegador,
   Apple Music y todo lo que aparece en el panel multimedia de Windows. Carátula, título,
   artista, barra de progreso en vivo (clic para adelantar) y anterior / pausa / siguiente.
+- **Letras sincronizadas (opcional).** La línea que se está cantando, en la píldora, desde la
+  base libre [LRCLIB](https://lrclib.net). En el panel se ven las líneas de alrededor y un
+  clic en una salta a ese momento. Apagadas por defecto: es la única función que usa internet.
 - **Volumen.** Un control en el panel (clic en el parlante para silenciar), la rueda del
   mouse sobre el notch y un aviso limpio cada vez que cambia el volumen.
 - **Avisos del sistema.** Brillo (pantalla de laptop), cambio de salida de audio
@@ -27,11 +30,11 @@ que suena y lo que tu PC quiere contarte. Después se aparta.
 
 ## Liviano por diseño
 
-| | Isla 0.2, todo activado |
+| | Isla 0.3, todo activado |
 |---|---|
-| Descarga | un `.exe` de ~0,45 MB, sin instalador |
-| Memoria | ~13 MB privados (37 MB de working set) |
-| CPU en reposo | 0 %, también con música |
+| Descarga | un `.exe` de ~0,5 MB, sin instalador |
+| Memoria | ~10 MB privados; ~14 MB con letras |
+| CPU en reposo | 0 %, también con música (letras: un deslizamiento breve por línea) |
 | Dependencias | ninguna; Windows 10 1809+ o Windows 11, 64 bits |
 
 - **Win32 nativo + Direct2D**, escrito en Rust. Sin motor web, sin .NET, sin Electron.
@@ -41,8 +44,8 @@ que suena y lo que tu PC quiere contarte. Después se aparta.
 - **Dibuja solo cuando algo se mueve**, a partir de vistas cacheadas en bitmaps.
 - **Sin driver de GPU en el proceso:** dibuja con WARP y Windows compone en la GPU, así
   la GPU dedicada de una laptop no se despierta.
-- **Sin hooks de teclado ni mouse, sin red, sin telemetría.** El atajo Win+Alt+N es una
-  tecla rápida registrada: Windows solo informa esa combinación.
+- **Sin hooks de teclado ni mouse, sin telemetría y sin red salvo que actives las letras.**
+  El atajo Win+Alt+N es una tecla rápida registrada: Windows solo informa esa combinación.
 
 ## Instalación
 
@@ -55,8 +58,9 @@ que suena y lo que tu PC quiere contarte. Después se aparta.
    y no está firmado: **Más información → Ejecutar de todas formas**. GitHub Actions lo
    compila desde este repositorio, así que puedes verificar exactamente lo que corres.
 
-Clic derecho en el icono de la bandeja para los ajustes: iniciar con Windows, intervalo
-del recordatorio, meta diaria, tamaño del vaso o salir. Los ajustes se guardan en
+Clic derecho en el icono de la bandeja para los ajustes: iniciar con Windows, avisos,
+letras sincronizadas y su sincronía, intervalo del recordatorio, meta diaria, tamaño del
+vaso, Pomodoro o salir. Los ajustes se guardan en
 `%APPDATA%\Isla\settings.ini`.
 
 Para desinstalar: desmarca "Iniciar con Windows" si lo activaste, sal desde la bandeja y
@@ -64,8 +68,14 @@ borra el exe y `%APPDATA%\Isla`.
 
 ## Privacidad
 
-Isla no se conecta a internet. Lee la sesión multimedia que Windows ya expone (título,
-artista, carátula) y el estado de energía. Tu registro de agua queda en tu carpeta.
+Isla lee la sesión multimedia que Windows ya expone (título, artista, carátula) y el estado
+de energía. Tu registro de agua queda en tu carpeta.
+
+De fábrica, Isla no se conecta a internet. Si activas las **letras sincronizadas**, envía
+a [lrclib.net](https://lrclib.net) el título, el artista, el álbum y la duración de cada
+canción nueva para buscar su letra, y nada más: ni identificadores ni cookies. Las letras
+quedan solo en memoria. Con las letras apagadas, Isla ni siquiera carga las bibliotecas de
+red de Windows.
 
 ## Compilar
 
