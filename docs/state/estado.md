@@ -22,9 +22,10 @@ Actualizado: 2026-10-26
   `x86_64-pc-windows-msvc` (solo para `cargo check`/`clippy`), componentes clippy, rustfmt y
   llvm-tools. PATH del sistema no modificado: para compilar, anteponer `%USERPROFILE%\.cargo\bin`
   y `%USERPROFILE%\.cargo\llvm-dlltool` (ver CONTRIBUTING.md).
-- Isla v0.3.1 corre en la PC del dueño desde `target\release\isla.exe` de la carpeta principal, con
-  inicio automático. Cada arranque reescribe la ruta de inicio automático con la del exe que
-  arrancó: tras probar desde un worktree, relanzar desde la carpeta principal.
+- Isla corre en la PC del dueño compilada desde `main` (`ab98fc8`: v0.3.1 más los reintentos de
+  letras), desde `target\release\isla.exe` de la carpeta principal, con inicio automático. Cada
+  arranque reescribe la ruta de inicio automático con la del exe que arrancó: tras probar desde un
+  worktree, relanzar desde la carpeta principal.
 
 ## Pendientes
 
@@ -34,6 +35,14 @@ Actualizado: 2026-10-26
   brillo, cambio de salida de audio, batería baja, monitor activo (si hay dos monitores).
 - QA del dueño de v0.3.1: apagar y volver a encender el aviso de brillo, y apagar el de mic/cámara
   desde el menú (no se probó con un script para no cambiar el brillo ni operar el menú de su PC).
+- Reintentos de letras ante LRCLIB saturado: en `main` (`ab98fc8`, PR #9; sale en v0.3.2). Si
+  falla, reintenta a los 2, 5, 10 y 20 s mientras suene la misma canción. Ver
+  `docs/audits/2026-10-26-lyrics-retry.md`, que también compara fuentes gratis (solo LRCLIB sirve).
+- Letras: si la versión de Spotify dura más de 3 s distinto que las de LRCLIB, no hay letra (p. ej.
+  "Soulmate" de Mac Miller: 267 s en Spotify, 273–278 s en LRCLIB). Ampliar la tolerancia puede
+  desfasar la letra: lo decide el dueño.
+- La decisión 0004 (punto 4) todavía describe el reintento anterior ("una vez a los 1,5 s").
+  `docs/decisions/*` no se toca sin pedido explícito del dueño.
 - Sin probar: Windows 10, varios monitores. (La PC del dueño usa escala 125 % y 144 Hz.)
 - Instalar la plantilla del workflow para habilitar el worker.
 
