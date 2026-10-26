@@ -2,10 +2,12 @@
 //!
 //! Off by default. When on, the title, artist, album and duration of each new
 //! track are sent to lrclib.net, and nothing else. Requests run on their own
-//! thread, which sleeps on a channel between tracks.
+//! thread, which sleeps on a channel between tracks. LRCLIB is often busy, so
+//! a failed lookup is tried again while the same track plays.
 
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -18,6 +20,9 @@ const HOST: &str = "lrclib.net";
 /// (radio edit, live...). Their timings would not match what is playing.
 const DURATION_TOLERANCE: f64 = 3.0;
 const CACHE_SIZE: usize = 24;
+/// Seconds to wait before each new try while LRCLIB is busy or unreachable:
+/// about 40 s in all, well within a song. A track change ends the wait.
+const RETRY_DELAYS: [u64; 4] = [2, 5, 10, 20];
 
 pub struct Line {
     /// Seconds from the start of the track.
@@ -129,16 +134,20 @@ impl Query {
 /// The answer for one request: its generation and the lyrics, if any were found.
 pub type Answer = (u64, Option<Arc<Lyrics>>);
 
+type Request = (u64, Query);
+type Found = Option<Arc<Lyrics>>;
+
 pub struct Fetcher {
-    tx: Sender<(u64, Query)>,
+    tx: Sender<Request>,
     pub answer: Arc<Mutex<Option<Answer>>>,
 }
 
 impl Fetcher {
-    /// Starts the worker; it posts `message` (WPARAM = generation) after each request.
+    /// Starts the worker; it posts `message` (WPARAM = generation) when it has an
+    /// answer, and once more if a retry finds the lyrics later.
     /// Dropping the fetcher ends the thread.
     pub fn start(hwnd: HWND, message: u32) -> Self {
-        let (tx, rx) = mpsc::channel::<(u64, Query)>();
+        let (tx, rx) = mpsc::channel::<Request>();
         let answer = Arc::new(Mutex::new(None));
         let slot = answer.clone();
         let hwnd = hwnd.0 as isize;
@@ -149,10 +158,20 @@ impl Fetcher {
                     "Isla/{} (https://github.com/sirtony27/isla)",
                     env!("CARGO_PKG_VERSION")
                 );
-                let mut cache: Vec<(String, Option<Arc<Lyrics>>)> = Vec::new();
-                while let Ok(first) = rx.recv() {
+                let delays = RETRY_DELAYS.map(Duration::from_secs);
+                let mut cache: Vec<(String, Found)> = Vec::new();
+                let mut next = None;
+                while let Some(first) = next.take().or_else(|| rx.recv().ok()) {
                     // Only the newest track matters when the user skips quickly.
                     let (generation, query) = rx.try_iter().last().unwrap_or(first);
+                    let publish = |found: Found| {
+                        if let Ok(mut slot) = slot.lock() {
+                            *slot = Some((generation, found));
+                        }
+                        let hwnd = HWND(hwnd as _);
+                        let wp = WPARAM(generation as usize);
+                        let _ = unsafe { PostMessageW(Some(hwnd), message, wp, LPARAM(0)) };
+                    };
                     let key = query.key();
                     let found = if let Some(i) = cache.iter().position(|(k, _)| *k == key) {
                         let entry = cache.remove(i);
@@ -160,27 +179,43 @@ impl Fetcher {
                         cache.push(entry);
                         found
                     } else {
-                        // A connection per track, closed right after: between songs
-                        // nothing stays open.
-                        let client = Client::new(&agent, HOST);
-                        match client.as_ref().map(|c| lookup(c, &query)) {
-                            Some(Ok(found)) => {
+                        let mut lookup = Lookup::new(&query);
+                        let outcome = with_retries(
+                            &rx,
+                            &delays,
+                            // A connection per try, closed right after: nothing stays
+                            // open between songs or while waiting to try again.
+                            || match Client::new(&agent, HOST) {
+                                Some(client) => lookup.attempt(|path| client.get(path)),
+                                None => Err(()),
+                            },
+                            // After two failed tries, stop holding the lyrics layout
+                            // of the previous track while waiting.
+                            |tries| {
+                                if tries == 2 {
+                                    publish(None);
+                                }
+                            },
+                        );
+                        match outcome {
+                            Outcome::Done(Ok(found)) => {
                                 cache.push((key, found.clone()));
                                 if cache.len() > CACHE_SIZE {
                                     cache.remove(0);
                                 }
                                 found
                             }
-                            // Offline or server busy: not cached, so the track is retried next time.
-                            _ => None,
+                            // Offline or busy the whole time: not cached, so the track
+                            // is looked up again the next time it plays.
+                            Outcome::Done(Err(())) => None,
+                            Outcome::Superseded(newer) => {
+                                next = Some(newer);
+                                continue;
+                            }
+                            Outcome::Closed => return,
                         }
                     };
-                    if let Ok(mut slot) = slot.lock() {
-                        *slot = Some((generation, found));
-                    }
-                    let hwnd = HWND(hwnd as _);
-                    let wp = WPARAM(generation as usize);
-                    let _ = unsafe { PostMessageW(Some(hwnd), message, wp, LPARAM(0)) };
+                    publish(found);
                 }
             });
         Self { tx, answer }
@@ -191,63 +226,126 @@ impl Fetcher {
     }
 }
 
-/// Tries the exact match first, then a search. `Err` means a request failed,
-/// so "not found" cannot be trusted.
-fn lookup(client: &Client, q: &Query) -> Result<Option<Arc<Lyrics>>, ()> {
-    let mut failed = false;
-    if q.duration > 0.0 {
-        let mut path = format!(
-            "/api/get?track_name={}&artist_name={}&duration={}",
-            net::encode(&q.title),
-            net::encode(&q.artist),
-            q.duration.round()
-        );
-        if !q.album.is_empty() {
-            path.push_str(&format!("&album_name={}", net::encode(&q.album)));
+/// How a lookup with retries ended.
+enum Outcome {
+    /// The lookup's answer, or `Err` if every try failed.
+    Done(Result<Found, ()>),
+    /// A newer track arrived while waiting to try again.
+    Superseded(Request),
+    /// The fetcher was dropped.
+    Closed,
+}
+
+/// Runs `attempt` until it gives a real answer, waiting longer before each new
+/// try. The wait is on the request channel, so a newer track ends it at once.
+/// `waiting` gets the number of failed tries before each wait.
+fn with_retries(
+    rx: &Receiver<Request>,
+    delays: &[Duration],
+    mut attempt: impl FnMut() -> Result<Found, ()>,
+    mut waiting: impl FnMut(usize),
+) -> Outcome {
+    let mut result = attempt();
+    for (tries, &delay) in (1..).zip(delays) {
+        if result.is_ok() {
+            break;
         }
-        match get(client, &path) {
-            Some((200, body)) => {
-                let json = std::str::from_utf8(&body).ok().and_then(Json::parse);
-                if let Some(json) = json {
-                    if json.get("instrumental").is_some_and(Json::is_true) {
-                        return Ok(None);
+        waiting(tries);
+        match rx.recv_timeout(delay) {
+            Ok(newer) => return Outcome::Superseded(newer),
+            Err(RecvTimeoutError::Timeout) => result = attempt(),
+            Err(RecvTimeoutError::Disconnected) => return Outcome::Closed,
+        }
+    }
+    Outcome::Done(result)
+}
+
+/// The requests for one track, in order: the exact match, then a search with
+/// the title as the player gives it and one with it tidied. A request that got
+/// an answer, found or not, is not sent again when the lookup is retried.
+struct Lookup {
+    /// Path, and whether it is `/api/get` (one record) rather than a search (a list).
+    pending: Vec<(String, bool)>,
+    duration: f64,
+}
+
+impl Lookup {
+    fn new(q: &Query) -> Self {
+        let mut pending = Vec::new();
+        if q.duration > 0.0 {
+            let mut path = format!(
+                "/api/get?track_name={}&artist_name={}&duration={}",
+                net::encode(&q.title),
+                net::encode(&q.artist),
+                q.duration.round()
+            );
+            if !q.album.is_empty() {
+                path.push_str(&format!("&album_name={}", net::encode(&q.album)));
+            }
+            pending.push((path, true));
+        }
+        let (title, artist) = tidy(&q.title, &q.artist);
+        let mut searches = vec![(q.title.clone(), q.artist.clone())];
+        if (title.as_str(), artist.as_str()) != (q.title.as_str(), q.artist.as_str()) {
+            searches.push((title, artist));
+        }
+        for (title, artist) in searches {
+            let path = format!(
+                "/api/search?track_name={}&artist_name={}",
+                net::encode(&title),
+                net::encode(&artist)
+            );
+            pending.push((path, false));
+        }
+        Self {
+            pending,
+            duration: q.duration,
+        }
+    }
+
+    /// Sends the requests still pending, until one finds the lyrics. `Err` means
+    /// LRCLIB was busy or unreachable for some of them, so "not found" cannot
+    /// be trusted yet.
+    fn attempt(
+        &mut self,
+        mut get: impl FnMut(&str) -> Option<(u32, Vec<u8>)>,
+    ) -> Result<Found, ()> {
+        let mut i = 0;
+        while i < self.pending.len() {
+            let (path, exact) = &self.pending[i];
+            let exact = *exact;
+            match get(path) {
+                Some((200, body)) => {
+                    let json = std::str::from_utf8(&body).ok().and_then(Json::parse);
+                    if let Some(json) = json {
+                        if exact && json.get("instrumental").is_some_and(Json::is_true) {
+                            return Ok(None);
+                        }
+                        let lyrics = if exact {
+                            let lrc = json.get("syncedLyrics").and_then(Json::str);
+                            lrc.and_then(Lyrics::parse)
+                        } else {
+                            best_match(&json, self.duration)
+                        };
+                        if let Some(lyrics) = lyrics {
+                            return Ok(Some(Arc::new(lyrics)));
+                        }
                     }
-                    let lrc = json.get("syncedLyrics").and_then(Json::str);
-                    if let Some(lyrics) = lrc.and_then(Lyrics::parse) {
-                        return Ok(Some(Arc::new(lyrics)));
-                    }
+                    self.pending.remove(i);
+                }
+                // Busy or unreachable: kept for the next try.
+                Some((429 | 500..=599, _)) | None => i += 1,
+                // Not found, or a refusal that trying again would not change.
+                Some(_) => {
+                    self.pending.remove(i);
                 }
             }
-            Some((404, _)) => {}
-            _ => failed = true,
         }
-    }
-    let (title, artist) = tidy(&q.title, &q.artist);
-    let mut attempts = vec![(q.title.clone(), q.artist.clone())];
-    if (title.as_str(), artist.as_str()) != (q.title.as_str(), q.artist.as_str()) {
-        attempts.push((title, artist));
-    }
-    for (title, artist) in attempts {
-        let path = format!(
-            "/api/search?track_name={}&artist_name={}",
-            net::encode(&title),
-            net::encode(&artist)
-        );
-        match get(client, &path) {
-            Some((200, body)) => {
-                let json = std::str::from_utf8(&body).ok().and_then(Json::parse);
-                if let Some(lyrics) = json.and_then(|j| best_match(&j, q.duration)) {
-                    return Ok(Some(Arc::new(lyrics)));
-                }
-            }
-            Some((404, _)) => {}
-            _ => failed = true,
+        if self.pending.is_empty() {
+            Ok(None)
+        } else {
+            Err(())
         }
-    }
-    if failed {
-        Err(())
-    } else {
-        Ok(None)
     }
 }
 
@@ -362,17 +460,6 @@ fn squash(s: &str) -> String {
     words(s).collect()
 }
 
-/// GET with one retry when LRCLIB says it is busy, as its answer asks.
-fn get(client: &Client, path: &str) -> Option<(u32, Vec<u8>)> {
-    match client.get(path) {
-        Some((429 | 503, _)) => {
-            std::thread::sleep(std::time::Duration::from_millis(1500));
-            client.get(path)
-        }
-        other => other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,21 +497,142 @@ mod tests {
         assert_eq!(text(0.0).as_deref(), Some("long"));
     }
 
-    #[test]
-    #[ignore = "talks to lrclib.net"]
-    fn live_lookup() {
-        let client = Client::new("Isla tests (https://github.com/sirtony27/isla)", HOST).unwrap();
-        let query = |title: &str, artist: &str, album: &str, duration| Query {
+    fn query(title: &str, artist: &str, album: &str, duration: f64) -> Query {
+        Query {
             title: title.into(),
             artist: artist.into(),
             album: album.into(),
             duration,
-        };
-        let exact = lookup(
-            &client,
-            &query("One More Time", "Daft Punk", "Discovery", 320.0),
+        }
+    }
+
+    #[test]
+    fn retries_only_what_failed() {
+        let q = query(
+            "Daft Punk - One More Time (Official Video)",
+            "DaftPunkVEVO",
+            "",
+            320.0,
         );
-        assert!(exact.unwrap().unwrap().lines.len() > 20);
+        let mut lookup = Lookup::new(&q);
+        let mut sent = Vec::new();
+        // Busy, nothing found, unreachable.
+        let mut replies = [Some((503, vec![])), Some((200, b"[]".to_vec())), None].into_iter();
+        let first = lookup.attempt(|path| {
+            sent.push(path.to_string());
+            replies.next().unwrap()
+        });
+        assert!(first.is_err());
+        assert_eq!(sent.len(), 3);
+        // The second try skips the search that already answered.
+        sent.clear();
+        let found = br#"[{"duration":321.0,"syncedLyrics":"[00:01.00]One more time"}]"#;
+        let mut replies = [Some((404, vec![])), Some((200, found.to_vec()))].into_iter();
+        let second = lookup.attempt(|path| {
+            sent.push(path.to_string());
+            replies.next().unwrap()
+        });
+        assert_eq!(second.unwrap().unwrap().lines[0].text, "One more time");
+        assert!(sent[0].starts_with("/api/get?"));
+        assert!(sent[1].ends_with("track_name=One%20More%20Time&artist_name=Daft%20Punk"));
+        assert_eq!(sent.len(), 2);
+    }
+
+    #[test]
+    fn answers_are_final() {
+        let q = query("Song", "Artist", "", 200.0);
+        // Not found anywhere, and a refusal a retry would not change.
+        let none = Lookup::new(&q).attempt(|path| match path.starts_with("/api/get") {
+            true => Some((404, vec![])),
+            false => Some((200, b"[]".to_vec())),
+        });
+        assert!(matches!(none, Ok(None)));
+        assert!(matches!(
+            Lookup::new(&q).attempt(|_| Some((400, vec![]))),
+            Ok(None)
+        ));
+        // Instrumental: no lyrics, and no search after it.
+        let mut sent = 0;
+        let instrumental = Lookup::new(&q).attempt(|_| {
+            sent += 1;
+            Some((200, br#"{"instrumental":true}"#.to_vec()))
+        });
+        assert!(matches!(instrumental, Ok(None)));
+        assert_eq!(sent, 1);
+    }
+
+    #[test]
+    fn retries_until_answered_or_superseded() {
+        let (tx, rx) = mpsc::channel::<Request>();
+        let delays = [Duration::from_millis(1); 3];
+        let lyrics = Arc::new(Lyrics::parse("[00:01.00]x").unwrap());
+        // Fails twice, then finds the lyrics.
+        let (mut tries, mut waits) = (0, Vec::new());
+        let outcome = with_retries(
+            &rx,
+            &delays,
+            || {
+                tries += 1;
+                if tries < 3 {
+                    Err(())
+                } else {
+                    Ok(Some(lyrics.clone()))
+                }
+            },
+            |n| waits.push(n),
+        );
+        assert!(matches!(outcome, Outcome::Done(Ok(Some(_)))));
+        assert_eq!((tries, waits), (3, vec![1, 2]));
+        // Never answers: one try, then one per delay.
+        let mut tries = 0;
+        let outcome = with_retries(
+            &rx,
+            &delays,
+            || {
+                tries += 1;
+                Err(())
+            },
+            |_| {},
+        );
+        assert!(matches!(outcome, Outcome::Done(Err(()))));
+        assert_eq!(tries, 4);
+        // A newer track ends the wait.
+        tx.send((7, query("Next", "Artist", "", 0.0))).unwrap();
+        let mut tries = 0;
+        let outcome = with_retries(
+            &rx,
+            &delays,
+            || {
+                tries += 1;
+                Err(())
+            },
+            |_| {},
+        );
+        assert!(matches!(outcome, Outcome::Superseded((7, _))));
+        assert_eq!(tries, 1);
+        // The fetcher is gone.
+        drop(tx);
+        let outcome = with_retries(&rx, &delays, || Err(()), |_| {});
+        assert!(matches!(outcome, Outcome::Closed));
+    }
+
+    #[test]
+    #[ignore = "talks to lrclib.net"]
+    fn live_lookup() {
+        let client = Client::new("Isla tests (https://github.com/sirtony27/isla)", HOST).unwrap();
+        // LRCLIB is often busy: spaced tries, as the fetcher does.
+        let find = |q: &Query| -> Found {
+            let mut lookup = Lookup::new(q);
+            for _ in 0..5 {
+                if let Ok(found) = lookup.attempt(|path| client.get(path)) {
+                    return found;
+                }
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            panic!("lrclib.net stayed busy");
+        };
+        let exact = find(&query("One More Time", "Daft Punk", "Discovery", 320.0));
+        assert!(exact.unwrap().lines.len() > 20);
         // No duration and a video-style title: found through the search.
         let video = query(
             "The Weeknd - Blinding Lights (Official Video)",
@@ -432,9 +640,8 @@ mod tests {
             "",
             0.0,
         );
-        assert!(lookup(&client, &video).unwrap().is_some());
-        let missing = query("Zzqx nonexistent song", "Nobody Qq", "", 0.0);
-        assert!(lookup(&client, &missing).unwrap().is_none());
+        assert!(find(&video).is_some());
+        assert!(find(&query("Zzqx nonexistent song", "Nobody Qq", "", 0.0)).is_none());
     }
 
     #[test]
