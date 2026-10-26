@@ -1,17 +1,20 @@
 //! Microphone / camera "in use" indicator. Windows records every app's use of
 //! those devices in the registry (CapabilityAccessManager). A thread sleeps
-//! until one of those keys changes, then rescans and tells the UI.
+//! until one of those keys changes, then rescans and tells the UI. Dropping
+//! the `Watcher` ends the thread and its registry notifications.
 
 use std::sync::{Arc, Mutex};
 
 use windows::core::{HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_SUCCESS, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegGetValueW, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY,
     HKEY_CURRENT_USER, KEY_READ, REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_CHANGE_NAME,
     RRF_RT_REG_QWORD,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects, INFINITE};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 const STORE: &str =
@@ -24,10 +27,45 @@ pub struct InUse {
     pub cam: Option<String>,
 }
 
-pub fn start(hwnd: HWND, message: u32) -> Arc<Mutex<InUse>> {
+/// An event handle shared by the watcher and its thread; closed when both are done.
+struct Event(HANDLE);
+
+// The handle is only signaled and waited on, which Windows allows from any thread.
+unsafe impl Send for Event {}
+unsafe impl Sync for Event {}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+pub struct Watcher {
+    pub in_use: Arc<Mutex<InUse>>,
+    stop: Option<Arc<Event>>,
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.stop {
+            let _ = unsafe { SetEvent(stop.0) };
+        }
+    }
+}
+
+pub fn start(hwnd: HWND, message: u32) -> Watcher {
     let shared = Arc::new(Mutex::new(InUse::default()));
     let out = shared.clone();
     let hwnd = hwnd.0 as isize;
+    let stop = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
+        .ok()
+        .map(|h| Arc::new(Event(h)));
+    let Some(thread_stop) = stop.clone() else {
+        return Watcher {
+            in_use: shared,
+            stop: None,
+        };
+    };
     let _ = std::thread::Builder::new()
         .name("privacy".into())
         .spawn(move || unsafe {
@@ -42,11 +80,11 @@ pub fn start(hwnd: HWND, message: u32) -> Arc<Mutex<InUse>> {
                         .map(|ev| (key, ev))
                 })
                 .collect();
-            if watched.is_empty() {
-                return;
-            }
-            let events: Vec<HANDLE> = watched.iter().map(|&(_, ev)| ev).collect();
-            loop {
+            // The stop event first: index 0 of the wait.
+            let events: Vec<HANDLE> = std::iter::once(thread_stop.0)
+                .chain(watched.iter().map(|&(_, ev)| ev))
+                .collect();
+            while !watched.is_empty() {
                 // Re-arm before scanning so no change between the two is missed.
                 for &(key, ev) in &watched {
                     let filter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET;
@@ -66,10 +104,25 @@ pub fn start(hwnd: HWND, message: u32) -> Arc<Mutex<InUse>> {
                 if changed {
                     let _ = PostMessageW(Some(HWND(hwnd as _)), message, WPARAM(0), LPARAM(0));
                 }
-                WaitForMultipleObjects(&events, false, INFINITE);
+                // Stopped, or the wait itself failed: either way, do not spin.
+                let woke = WaitForMultipleObjects(&events, false, INFINITE);
+                if woke == WAIT_OBJECT_0 || woke.0 >= WAIT_OBJECT_0.0 + events.len() as u32 {
+                    break;
+                }
+            }
+            // Keys first: closing one cancels its notification and signals its event,
+            // which must still be open then.
+            for key in keys.into_iter().flatten() {
+                let _ = RegCloseKey(key);
+            }
+            for &(_, ev) in &watched {
+                let _ = CloseHandle(ev);
             }
         });
-    shared
+    Watcher {
+        in_use: shared,
+        stop,
+    }
 }
 
 unsafe fn open(capability: &str) -> Option<HKEY> {

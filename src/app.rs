@@ -2,7 +2,7 @@
 //! Everything here runs on the UI thread, driven by window messages.
 
 use std::mem::size_of;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use windows::core::{w, Result, GUID};
@@ -12,7 +12,10 @@ use windows::Win32::Graphics::Gdi::{
     CreateRectRgn, GetMonitorInfoW, SetWindowRgn, HMONITOR, MONITORINFO,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Power::{RegisterPowerSettingNotification, POWERBROADCAST_SETTING};
+use windows::Win32::System::Power::{
+    RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY,
+    POWERBROADCAST_SETTING,
+};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -145,7 +148,8 @@ pub struct App {
 
     audio: Option<Audio>,
     brightness: Option<u8>,
-    privacy: Option<Arc<Mutex<InUse>>>,
+    brightness_notify: Option<HPOWERNOTIFY>,
+    privacy: Option<privacy::Watcher>,
     in_use: InUse,
     privacy_shown: (bool, String),
     focus: Focus,
@@ -219,8 +223,9 @@ impl App {
             art_pixels: None,
             layers: Layers::default(),
             live_timer: false,
-            audio: Audio::new(hwnd, WM_APP_AUDIO).ok(),
+            audio: None,
             brightness: None,
+            brightness_notify: None,
             privacy: settings
                 .notify_privacy
                 .then(|| privacy::start(hwnd, WM_APP_PRIVACY)),
@@ -255,11 +260,8 @@ impl App {
         unsafe {
             let mut abd = app.appbar_data();
             SHAppBarMessage(ABM_NEW, &mut abd);
-            for guid in [
-                GUID_ACDC_POWER_SOURCE,
-                GUID_BATTERY_PERCENTAGE_REMAINING,
-                GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS,
-            ] {
+            // Also feed the battery card of the panel, so they stay registered.
+            for guid in [GUID_ACDC_POWER_SOURCE, GUID_BATTERY_PERCENTAGE_REMAINING] {
                 let _ = RegisterPowerSettingNotification(
                     HANDLE(hwnd.0),
                     &guid,
@@ -268,6 +270,8 @@ impl App {
             }
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
+        app.sync_brightness();
+        app.sync_audio();
         sys::set_hotkey(hwnd, app.settings.hotkey);
         app.set_timer(TIMER_CLOCK, sys::ms_to_next_minute());
         app.schedule_water();
@@ -507,6 +511,7 @@ impl App {
         }
         self.mode = mode;
         self.retarget();
+        self.sync_audio();
         self.update_live_timer();
         self.sync_lyrics();
     }
@@ -565,6 +570,7 @@ impl App {
         self.changed();
         self.update_live_timer();
         self.sync_lyrics();
+        self.sync_audio();
     }
 
     fn springs(&mut self) -> [&mut Spring; 7] {
@@ -600,6 +606,7 @@ impl App {
         if settled {
             self.animating = false;
             self.fit_region();
+            self.sync_audio();
         }
         self.render();
     }
@@ -824,7 +831,12 @@ impl App {
     }
 
     fn on_wheel(&mut self, steps: f32) {
+        // The overlay needs Core Audio even while the volume alert is off.
+        if self.audio.is_none() {
+            self.audio = Audio::new(self.hwnd, WM_APP_AUDIO).ok();
+        }
         let Some(audio) = self.audio.as_mut().filter(|a| a.available()) else {
+            self.sync_audio();
             return;
         };
         audio.set_level(audio.level + steps * VOLUME_STEP);
@@ -833,6 +845,7 @@ impl App {
         } else {
             self.show_level(Act::Volume);
         }
+        self.sync_audio();
     }
 
     fn on_tray_click(&mut self) {
@@ -1078,6 +1091,50 @@ impl App {
         }
     }
 
+    /// Core Audio is loaded only while something uses it: the volume or audio
+    /// output alert, the open panel (its volume row) or the volume overlay.
+    fn wants_audio(&self) -> bool {
+        let s = &self.settings;
+        s.notify_volume
+            || s.notify_audio
+            || matches!(
+                self.mode,
+                Mode::Open | Mode::Activity(Act::Volume | Act::Device)
+            )
+    }
+
+    fn sync_audio(&mut self) {
+        match (self.wants_audio(), self.audio.is_some()) {
+            (true, false) => self.audio = Audio::new(self.hwnd, WM_APP_AUDIO).ok(),
+            // Kept until the panel has finished closing, so its volume row fades with it.
+            (false, true) if !self.animating => self.audio = None,
+            _ => {}
+        }
+    }
+
+    /// The brightness notification is registered only while its alert is on.
+    fn sync_brightness(&mut self) {
+        match (self.settings.notify_brightness, self.brightness_notify) {
+            (true, None) => {
+                // Windows answers with the current value right away: not a change.
+                self.brightness = None;
+                self.brightness_notify = unsafe {
+                    RegisterPowerSettingNotification(
+                        HANDLE(self.hwnd.0),
+                        &GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS,
+                        DEVICE_NOTIFY_WINDOW_HANDLE,
+                    )
+                }
+                .ok();
+            }
+            (false, Some(handle)) => {
+                let _ = unsafe { UnregisterPowerSettingNotification(handle) };
+                self.brightness_notify = None;
+            }
+            _ => {}
+        }
+    }
+
     fn on_brightness(&mut self, value: u8) {
         // Windows sends the current value right after registering: not a change.
         let previous = self.brightness.replace(value);
@@ -1090,7 +1147,7 @@ impl App {
         let Some(now) = self
             .privacy
             .as_ref()
-            .and_then(|s| s.lock().ok().map(|s| s.clone()))
+            .and_then(|w| w.in_use.lock().ok().map(|s| s.clone()))
         else {
             return;
         };
@@ -1330,9 +1387,17 @@ impl App {
 
     /// Starts or stops whatever depends on the settings that may have changed.
     fn apply_settings(&mut self) {
-        if self.settings.notify_privacy && self.privacy.is_none() {
-            self.privacy = Some(privacy::start(self.hwnd, WM_APP_PRIVACY));
+        match (self.settings.notify_privacy, self.privacy.is_some()) {
+            (true, false) => self.privacy = Some(privacy::start(self.hwnd, WM_APP_PRIVACY)),
+            (false, true) => {
+                // Ends the watcher thread and its registry notifications.
+                self.privacy = None;
+                self.in_use = InUse::default();
+            }
+            _ => {}
         }
+        self.sync_brightness();
+        self.sync_audio();
         match (self.settings.monitor_active, self.foreground_hook) {
             (true, None) => {
                 self.foreground_hook = Some(sys::watch_foreground(self.hwnd, WM_APP_FOREGROUND));

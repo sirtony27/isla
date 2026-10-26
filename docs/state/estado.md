@@ -29,9 +29,9 @@ Actualizado: 2026-10-26
   para eso está el menú "Sincronía de las letras".
 - QA del dueño de v0.2 con eventos reales: mic/cámara (p. ej. una llamada de Discord), teclas de
   brillo, cambio de salida de audio, batería baja, monitor activo (si hay dos monitores).
-- Alinear con la regla del presupuesto ("apagada, no registra eventos ni carga DLLs"): Core Audio
-  se carga siempre (lo usa la barra de volumen del panel) y la notificación de brillo se registra
-  aunque el aviso esté apagado. Costo medido dentro del presupuesto, pero la regla no se cumple al pie.
+- Regla "apagada, no registra eventos ni carga DLLs": alineada en `fix/budget-toggles` (Core Audio
+  bajo demanda, brillo solo con su aviso y el hilo de mic/cámara se detiene al apagarlo). Ver
+  `docs/audits/2026-10-26-budget-toggles.md`. Falta el QA del dueño de brillo y del menú de mic/cámara.
 - Sin probar: Windows 10, varios monitores. (La PC del dueño usa escala 125 % y 144 Hz.)
 - Instalar la plantilla del workflow para habilitar el worker.
 
