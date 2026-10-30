@@ -5,6 +5,10 @@ que suena y lo que tu PC quiere contarte. Después se aparta.
 
 [Read in English](README.md)
 
+<p align="center">
+  <img src="docs/media/demo-es.gif" width="640" alt="Isla arriba de la pantalla: la píldora muestra la línea que se canta, después se abre el panel con la carátula, los controles y la vista de letra, y se vuelve a cerrar">
+</p>
+
 - **Lo que suena, de cualquier reproductor.** Spotify, YouTube en cualquier navegador,
   Apple Music y todo lo que aparece en el panel multimedia de Windows. Carátula, título,
   artista, barra de progreso en vivo (clic para adelantar) y anterior / pausa / siguiente.

@@ -43,6 +43,11 @@ Actualizado: 2026-10-26
   desfasar la letra: lo decide el dueño.
 - La decisión 0004 (punto 4) todavía describe el reintento anterior ("una vez a los 1,5 s").
   `docs/decisions/*` no se toca sin pedido explícito del dueño.
+- winget: manifiestos de v0.3.2 en `packaging/winget/` (`sirtony27.Isla`, portable, validados con
+  `winget validate`). Falta enviarlos a microsoft/winget-pkgs con el OK del dueño (es su cuenta y
+  hay que firmar el CLA de Microsoft) y, cuando los acepten, sumar `winget install sirtony27.Isla`
+  a los README con dos avisos: salir de Isla antes de `winget upgrade` (el exe en uso no se puede
+  reemplazar) y que `winget uninstall` no borra `%APPDATA%\Isla` ni el inicio automático.
 - Sin probar: Windows 10, varios monitores. (La PC del dueño usa escala 125 % y 144 Hz.)
 - Instalar la plantilla del workflow para habilitar el worker.
 

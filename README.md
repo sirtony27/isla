@@ -5,6 +5,10 @@ the things your PC wants to tell you, then gets out of the way.
 
 [Leer en español](README.es.md)
 
+<p align="center">
+  <img src="docs/media/demo-en.gif" width="640" alt="Isla at the top of the screen: the pill shows the line being sung, then the panel opens with the cover, controls and the lyrics view, and closes again">
+</p>
+
 - **Now playing, from any player.** Spotify, YouTube in any browser, Apple Music, and
   anything else that shows up in the Windows media flyout. Album art, title, artist,
   a live progress bar you can click to seek, and previous / play-pause / next.

@@ -68,3 +68,18 @@ memory and CPU over 10 s idle (Task Manager or `Get-Process isla`).
 | `src/lyrics.rs` | Synced lyrics: LRCLIB lookup on its own thread, LRC parsing |
 | `src/net.rs` | HTTPS GET through WinHTTP, loaded only when lyrics are on |
 | `src/json.rs` | Minimal JSON parser for LRCLIB's answers |
+| `packaging/winget/` | Manifests for the Windows Package Manager |
+| `docs/media/` | Demo GIFs for the READMEs |
+
+## Releasing
+
+1. Bump the version in `Cargo.toml` and `Cargo.lock` in a pull request.
+2. Once it is merged, push a `vX.Y.Z` tag. CI builds `isla.exe` and `isla.exe.sha256` and
+   publishes the release.
+3. In `packaging/winget/`, update the version, installer URL, SHA-256 and release date, check
+   them with `winget validate --manifest packaging/winget`, and submit them to
+   [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) under
+   `manifests/s/sirtony27/Isla/<version>/`.
+
+The demo GIFs were recorded with a silent test track (a public-domain hymn), a generated
+cover and a generated backdrop, so they show nothing from anyone's screen or library.
